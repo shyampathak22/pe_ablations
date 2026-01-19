@@ -12,6 +12,8 @@ from src.model.embeddings import TokenEmbedding
 from src.model.ffn import FeedForward
 from src.model.normalization import RMSNorm
 from src.model.rope import RotaryEmbedding, NTKAwareRotaryEmbedding, YaRNRotaryEmbedding
+from src.model.fpope import FoPEPoPEEmbedding
+from src.model.fpope_attention import FPoPEGroupedQueryAttention
 
 
 @dataclass
@@ -28,11 +30,23 @@ class TransformerConfig:
     ffn_dim: int | None = None  # Defaults to 4 * hidden_dim * 2/3 rounded
     ffn_multiple_of: int = 256
 
-    # Positional encoding
+    # Positional encoding mode
+    pe_mode: Literal["rope", "fpope"] = "rope"
+
+    # General positional encoding
     max_seq_len: int = 512
+
+    # RoPE parameters (used when pe_mode="rope")
     rope_theta: float = 10000.0
     rope_type: Literal["standard", "ntk", "yarn"] = "standard"
     rope_scale: float = 1.0  # For NTK/YaRN scaling
+
+    # FoPE+PoPE parameters (used when pe_mode="fpope")
+    fpope_theta: float = 10000.0
+    fpope_num_fourier_terms: int = 64
+    fpope_sigma: float = 0.4
+    fpope_training_length: int = 512  # For floor frequency clipping
+    fpope_delta_init: str = "zero"  # "zero" for length gen, "uniform" for in-distribution
 
     # Normalization
     norm_eps: float = 1e-6
@@ -87,18 +101,36 @@ class TransformerConfig:
 class TransformerBlock(nn.Module):
     """Single transformer block with Pre-RMSNorm architecture."""
 
-    def __init__(self, config: TransformerConfig, rope: RotaryEmbedding):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        rope: RotaryEmbedding | None = None,
+        fpope: FoPEPoPEEmbedding | None = None,
+    ):
         super().__init__()
 
         self.attention_norm = RMSNorm(config.hidden_dim, eps=config.norm_eps)
-        self.attention = GroupedQueryAttention(
-            hidden_dim=config.hidden_dim,
-            num_heads=config.num_heads,
-            num_kv_heads=config.num_kv_heads,
-            head_dim=config.head_dim,
-            use_qk_norm=config.use_qk_norm,
-            rope=rope,
-        )
+
+        if config.pe_mode == "fpope":
+            # Use FPoPE-aware attention
+            self.attention = FPoPEGroupedQueryAttention(
+                hidden_dim=config.hidden_dim,
+                num_heads=config.num_heads,
+                num_kv_heads=config.num_kv_heads,
+                head_dim=config.head_dim,
+                use_qk_norm=config.use_qk_norm,
+                fpope=fpope,
+            )
+        else:
+            # Use standard RoPE attention
+            self.attention = GroupedQueryAttention(
+                hidden_dim=config.hidden_dim,
+                num_heads=config.num_heads,
+                num_kv_heads=config.num_kv_heads,
+                head_dim=config.head_dim,
+                use_qk_norm=config.use_qk_norm,
+                rope=rope,
+            )
 
         self.ffn_norm = RMSNorm(config.hidden_dim, eps=config.norm_eps)
         self.feed_forward = FeedForward(
@@ -149,32 +181,51 @@ class Transformer(nn.Module):
 
         self.token_embedding = TokenEmbedding(config.vocab_size, config.hidden_dim)
 
-        if config.rope_type == "standard":
-            self.rope = RotaryEmbedding(
-                config.head_dim,
-                config.max_seq_len,
-                config.rope_theta,
-            )
-        elif config.rope_type == "ntk":
-            self.rope = NTKAwareRotaryEmbedding(
-                config.head_dim,
-                config.max_seq_len,
-                config.rope_theta,
-                config.rope_scale,
-            )
-        elif config.rope_type == "yarn":
-            self.rope = YaRNRotaryEmbedding(
-                config.head_dim,
-                config.max_seq_len,
-                config.rope_theta,
-                config.rope_scale,
-                original_max_seq_len=512,
+        # Initialize positional encoding based on pe_mode
+        self.rope = None
+        self.fpope = None
+
+        if config.pe_mode == "rope":
+            # Standard RoPE variants
+            if config.rope_type == "standard":
+                self.rope = RotaryEmbedding(
+                    config.head_dim,
+                    config.max_seq_len,
+                    config.rope_theta,
+                )
+            elif config.rope_type == "ntk":
+                self.rope = NTKAwareRotaryEmbedding(
+                    config.head_dim,
+                    config.max_seq_len,
+                    config.rope_theta,
+                    config.rope_scale,
+                )
+            elif config.rope_type == "yarn":
+                self.rope = YaRNRotaryEmbedding(
+                    config.head_dim,
+                    config.max_seq_len,
+                    config.rope_theta,
+                    config.rope_scale,
+                    original_max_seq_len=512,
+                )
+            else:
+                raise ValueError(f"Unknown rope_type: {config.rope_type}")
+        elif config.pe_mode == "fpope":
+            # FoPE+PoPE combined encoding
+            self.fpope = FoPEPoPEEmbedding(
+                dim=config.head_dim,
+                max_seq_len=config.max_seq_len,
+                theta=config.fpope_theta,
+                num_fourier_terms=config.fpope_num_fourier_terms,
+                fourier_sigma=config.fpope_sigma,
+                training_length=config.fpope_training_length,
+                delta_init=config.fpope_delta_init,
             )
         else:
-            raise ValueError(f"Unknown rope_type: {config.rope_type}")
+            raise ValueError(f"Unknown pe_mode: {config.pe_mode}")
 
         self.layers = nn.ModuleList([
-            TransformerBlock(config, self.rope)
+            TransformerBlock(config, rope=self.rope, fpope=self.fpope)
             for _ in range(config.num_layers)
         ])
 
@@ -251,7 +302,10 @@ class Transformer(nn.Module):
         Args:
             new_max_seq_len: New maximum sequence length
         """
-        self.rope.extend_seq_len(new_max_seq_len)
+        if self.rope is not None:
+            self.rope.extend_seq_len(new_max_seq_len)
+        if self.fpope is not None:
+            self.fpope.extend_seq_len(new_max_seq_len)
         self.config.max_seq_len = new_max_seq_len
 
     @torch.no_grad()

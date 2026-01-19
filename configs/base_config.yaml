@@ -12,11 +12,23 @@ model:
   ffn_dim: null  # Auto-computed with SwiGLU scaling
   ffn_multiple_of: 256
 
-  # Positional encoding
+  # Positional encoding mode: "rope" or "fpope"
+  pe_mode: rope
+
+  # General positional encoding
   max_seq_len: 512  # Training context length
+
+  # RoPE parameters (when pe_mode=rope)
   rope_theta: 10000.0
   rope_type: standard  # standard, ntk, yarn
   rope_scale: 1.0
+
+  # FoPE+PoPE parameters (when pe_mode=fpope)
+  fpope_theta: 10000.0
+  fpope_num_fourier_terms: 64
+  fpope_sigma: 0.4
+  fpope_training_length: 512  # Must match max_seq_len for floor frequency
+  fpope_delta_init: zero  # "zero" for length generalization, "uniform" otherwise
 
   # Normalization
   norm_eps: 1.0e-6

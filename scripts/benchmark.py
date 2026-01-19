@@ -217,6 +217,7 @@ def main() -> None:
     dtype = torch.bfloat16 if config["training"]["mixed_precision"] == "bf16" else torch.float16
 
     print("Creating model...")
+    pe_mode = config["model"].get("pe_mode", "rope")
     model_config = TransformerConfig(
         vocab_size=config["model"]["vocab_size"],
         hidden_dim=config["model"]["hidden_dim"],
@@ -225,7 +226,18 @@ def main() -> None:
         num_kv_heads=config["model"]["num_kv_heads"],
         head_dim=config["model"]["head_dim"],
         max_seq_len=config["model"]["max_seq_len"],
-        rope_type=config["model"]["rope_type"],
+        pe_mode=pe_mode,
+        # RoPE parameters
+        rope_type=config["model"].get("rope_type", "standard"),
+        rope_theta=config["model"].get("rope_theta", 10000.0),
+        rope_scale=config["model"].get("rope_scale", 1.0),
+        # FPoPE parameters
+        fpope_theta=config["model"].get("fpope_theta", 10000.0),
+        fpope_num_fourier_terms=config["model"].get("fpope_num_fourier_terms", 64),
+        fpope_sigma=config["model"].get("fpope_sigma", 0.4),
+        fpope_training_length=config["model"].get("fpope_training_length", 512),
+        fpope_delta_init=config["model"].get("fpope_delta_init", "zero"),
+        # Other parameters
         use_qk_norm=config["model"]["use_qk_norm"],
         gradient_checkpointing=args.grad_checkpointing or config["model"]["gradient_checkpointing"],
     )
@@ -234,6 +246,11 @@ def main() -> None:
     model = model.to(device)
 
     print(f"Model parameters: {model_config.num_params:,}")
+    print(f"PE mode: {model_config.pe_mode}", end="")
+    if model_config.pe_mode == "rope":
+        print(f" ({model_config.rope_type})")
+    else:
+        print(f" (fourier_terms={model_config.fpope_num_fourier_terms})")
     print(f"GPU: {torch.cuda.get_device_name()}")
     print(f"GPU Memory: {torch.cuda.get_device_properties(device).total_memory / 1e9:.1f} GB")
     print(f"Mixed precision: {dtype}")
