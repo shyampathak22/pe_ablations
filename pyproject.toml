@@ -1,0 +1,36 @@
+[project]
+name = "pe-ablations"
+version = "0.1.0"
+description = "Modern transformer base model for positional embedding extrapolation experiments"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "torch>=2.9.1",
+    "numpy",
+    "einops",
+    "transformers",
+    "wandb",
+    "pyyaml",
+    "tqdm",
+    "datasets",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff",
+]
+
+[project.scripts]
+train = "scripts.train:main"
+evaluate = "scripts.evaluate:main"
+benchmark = "scripts.benchmark:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]
