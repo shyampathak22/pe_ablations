@@ -120,19 +120,22 @@ if HAS_TRITON:
             causal_mask = offs_m[:, None] < offs_n[None, :]
             scores = tl.where(causal_mask, float("-inf"), scores)
 
-            # Online softmax
+            # Online softmax with NaN guard
+            # When all scores are -inf (fully masked), m_ij=-inf and exp(-inf - (-inf))=NaN
             m_ij = tl.max(scores, axis=1)
             m_new = tl.maximum(m_i, m_ij)
             alpha = tl.exp(m_i - m_new)
             beta = tl.exp(m_ij - m_new)
-            p = tl.exp(scores - m_ij[:, None])
+            # Guard: if m_ij is -inf, p should be 0 (no contribution from this block)
+            p = tl.where(m_ij[:, None] == float("-inf"), 0.0, tl.exp(scores - m_ij[:, None]))
 
-            # Load V with FULL head_dim (BLOCK_N, BLOCK_D_OUT)
+            # Load V with FULL head_dim (BLOCK_N, BLOCK_D_OUT) - cast to float32 for precision
             v_ptrs = V_ptr + pid_bh * stride_vh + offs_n[:, None] * stride_vs + offs_d_out[None, :]
             v_mask = (offs_n[:, None] < seq_len_k) & (offs_d_out[None, :] < head_dim)
-            v = tl.load(v_ptrs, mask=v_mask, other=0.0)
+            v = tl.load(v_ptrs, mask=v_mask, other=0.0).to(tl.float32)
 
-            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+            # Keep everything in float32 for numerical stability
+            acc = acc * alpha[:, None] + tl.dot(p.to(tl.float32), v)
             l_i = l_i * alpha + beta * tl.sum(p, axis=1)
             m_i = m_new
 
@@ -273,7 +276,7 @@ def pytorch_fpope_attention(
         attn_scores = attn_scores.masked_fill(causal_mask, float("-inf"))
 
     # Softmax and apply to values
-    attn_probs = F.softmax(attn_scores, dim=-1)
+    attn_probs = F.softmax(attn_scores, dim=-1).to(v.dtype)
     output = torch.matmul(attn_probs, v)
 
     return output
