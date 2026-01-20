@@ -122,17 +122,16 @@ CKPT_DIRS=(
 for i in "${!RUN_NAMES[@]}"; do
     RUN_NAME="${RUN_NAMES[$i]}"
     CKPT_DIR="${CKPT_DIRS[$i]}"
-    CHECKPOINT="$PROJECT_DIR/$CKPT_DIR/best_model.pt"
+    CKPT_PATH="$PROJECT_DIR/$CKPT_DIR"
 
-    if [ -f "$CHECKPOINT" ]; then
-        echo "Evaluating: $RUN_NAME"
-        python "$PROJECT_DIR/scripts/evaluate.py" \
-            --checkpoint "$CHECKPOINT" \
+    if [ -d "$CKPT_PATH" ]; then
+        echo "Evaluating: $RUN_NAME (from $CKPT_DIR)"
+        "$PROJECT_DIR/scripts/run_eval.sh" "$CKPT_PATH" \
             --output-dir "$PROJECT_DIR/eval_results/${RUN_NAME}" \
             --context-lengths $CONTEXT_LENGTHS \
             --benchmarks passkey niah
     else
-        echo "Skipping $RUN_NAME - checkpoint not found at $CHECKPOINT"
+        echo "Skipping $RUN_NAME - checkpoint dir not found at $CKPT_PATH"
     fi
 done
 

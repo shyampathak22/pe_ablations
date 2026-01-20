@@ -52,7 +52,13 @@ def load_model(checkpoint_path: str, device: torch.device) -> tuple[Transformer,
     )
 
     model = Transformer(config)
-    model.load_state_dict(checkpoint["model_state_dict"])
+
+    # Handle torch.compile() checkpoints (have _orig_mod. prefix)
+    state_dict = checkpoint["model_state_dict"]
+    if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
+    model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
 
@@ -186,7 +192,7 @@ def main() -> None:
         "--checkpoint",
         type=str,
         required=True,
-        help="Path to model checkpoint",
+        help="Path to model checkpoint or directory containing checkpoints",
     )
     parser.add_argument(
         "--output-dir",
@@ -221,8 +227,18 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading model from {args.checkpoint}...")
-    model, config = load_model(args.checkpoint, device)
+    # Handle directory input - auto-select latest checkpoint
+    checkpoint_path = args.checkpoint
+    if Path(checkpoint_path).is_dir():
+        import glob
+        checkpoints = sorted(glob.glob(f"{checkpoint_path}/checkpoint_step_*.pt"))
+        if not checkpoints:
+            raise ValueError(f"No checkpoint_step_*.pt files found in {checkpoint_path}")
+        checkpoint_path = checkpoints[-1]
+        print(f"Auto-selected latest checkpoint: {checkpoint_path}")
+
+    print(f"Loading model from {checkpoint_path}...")
+    model, config = load_model(checkpoint_path, device)
     print(f"Model loaded: {config.num_params:,} parameters")
 
     tokenizer = get_tokenizer("gpt2")

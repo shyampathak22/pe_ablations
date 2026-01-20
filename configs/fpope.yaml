@@ -56,16 +56,16 @@ training:
 
   # Batch configuration
   total_tokens: 100000000  # 100M tokens
-  batch_size: 64  # Per GPU
+  batch_size: 8  # Per GPU
   seq_len: 512
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 4
 
   # Mixed precision
   mixed_precision: bf16
 
   # Validation
-  validation_interval: 500
-  validation_samples: 1000
+  validation_interval: 50
+  validation_samples: 100
 
   # Checkpointing
   checkpoint_dir: checkpoints/fpope

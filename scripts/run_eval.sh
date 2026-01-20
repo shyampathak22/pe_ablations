@@ -26,15 +26,26 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$TORCH_LIB:$NVIDIA_LIBS/cudnn/lib:$NVID
 source "$VENV_DIR/bin/activate"
 
 # Parse arguments
-CHECKPOINT="${1:?Error: checkpoint path required}"
+CHECKPOINT_ARG="${1:?Error: checkpoint path or directory required}"
 shift
+
+# If given a directory, find the latest checkpoint
+if [ -d "$CHECKPOINT_ARG" ]; then
+    CHECKPOINT=$(ls -t "$CHECKPOINT_ARG"/checkpoint_step_*.pt 2>/dev/null | head -1)
+    if [ -z "$CHECKPOINT" ]; then
+        echo "Error: No checkpoint_step_*.pt files found in $CHECKPOINT_ARG"
+        exit 1
+    fi
+    echo "Auto-selected latest checkpoint: $CHECKPOINT"
+else
+    CHECKPOINT="$CHECKPOINT_ARG"
+fi
 
 echo "=========================================="
 echo "PE Ablations Evaluation Launcher"
 echo "=========================================="
 echo "Checkpoint: $CHECKPOINT"
 echo "CUDA: $(nvcc --version 2>/dev/null | grep release | awk '{print $5}' | tr -d ',')"
-echo "PyTorch: $(python -c 'import torch; print(torch.__version__)')"
 echo "=========================================="
 
 # Run evaluation

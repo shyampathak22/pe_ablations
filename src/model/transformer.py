@@ -363,7 +363,15 @@ class Transformer(nn.Module):
                 self.extend_context_length(input_ids.shape[1])
 
             output = self.forward(input_ids)
-            logits = output["logits"][:, -1, :] / temperature
+            logits = output["logits"][:, -1, :]
+
+            # Temperature=0 means greedy decoding
+            if temperature == 0.0:
+                next_token = logits.argmax(dim=-1, keepdim=True)
+                input_ids = torch.cat([input_ids, next_token], dim=1)
+                continue
+
+            logits = logits / temperature
 
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
