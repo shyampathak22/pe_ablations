@@ -4,10 +4,8 @@
 # Usage:
 #   python main.py train --config configs/fpope.yaml
 #
-# Evaluation:
-#   python main.py eval --benchmark passkey --context_lengths 512,1024,2048,4096,8192
-#   python main.py eval --benchmark niah --context_lengths 512,1024,2048,4096
-#   python main.py eval --benchmark ruler --context_lengths 512,1024,2048,4096
+# Evaluation (PPL degradation):
+#   python scripts/evaluate_ppl_degradation.py --checkpoint-dir checkpoints/fpope
 
 model:
   # Architecture (same as base)
@@ -103,11 +101,7 @@ distributed:
   bucket_cap_mb: 50
   find_unused_parameters: false
 
-# Evaluation contexts for length generalization testing
+# Evaluation contexts for length generalization testing (PPL degradation)
 # Key experiment: trained on 512, evaluated at longer lengths
 evaluation:
   contexts: [512, 1024, 2048, 4096, 8192, 16384]
-  benchmarks:
-    - passkey  # Find hidden passkey in long context
-    - niah     # Needle-in-a-haystack retrieval
-    - ruler    # RULER benchmark for extended context

@@ -100,9 +100,6 @@ distributed:
   bucket_cap_mb: 50
   find_unused_parameters: false
 
-# Evaluation contexts for extrapolation testing
+# Evaluation contexts for extrapolation testing (PPL degradation)
 evaluation:
-  contexts: [1024, 2048, 4096, 8192, 16384]
-  benchmarks:
-    - passkey
-    - niah
+  contexts: [512, 1024, 2048, 4096, 8192, 16384]

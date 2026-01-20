@@ -1,7 +1,8 @@
-"""Evaluation benchmarks for context length extrapolation."""
+"""Evaluation utilities.
 
-from src.evaluation.passkey import PasskeyRetrievalBenchmark
-from src.evaluation.niah import NIAHBenchmark
-from src.evaluation.ruler import RULERBenchmark
+Primary evaluation is done via:
+- scripts/evaluate_ppl_degradation.py - PPL degradation across context lengths
+- scripts/evaluate_long_context.py - Long context eval with KV cache offloading
+"""
 
-__all__ = ["PasskeyRetrievalBenchmark", "NIAHBenchmark", "RULERBenchmark"]
+__all__ = []
