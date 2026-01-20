@@ -102,25 +102,49 @@ def main() -> None:
             return
 
     print_rank0("Creating model...")
-    model_config = TransformerConfig(
-        vocab_size=config["model"]["vocab_size"],
-        hidden_dim=config["model"]["hidden_dim"],
-        num_layers=config["model"]["num_layers"],
-        num_heads=config["model"]["num_heads"],
-        num_kv_heads=config["model"]["num_kv_heads"],
-        head_dim=config["model"]["head_dim"],
-        ffn_dim=config["model"]["ffn_dim"],
-        ffn_multiple_of=config["model"]["ffn_multiple_of"],
-        max_seq_len=config["model"]["max_seq_len"],
-        rope_theta=config["model"]["rope_theta"],
-        rope_type=config["model"]["rope_type"],
-        rope_scale=config["model"]["rope_scale"],
-        norm_eps=config["model"]["norm_eps"],
-        use_qk_norm=config["model"]["use_qk_norm"],
-        dropout=config["model"]["dropout"],
-        tie_embeddings=config["model"]["tie_embeddings"],
-        gradient_checkpointing=config["model"]["gradient_checkpointing"],
-    )
+
+    # Get positional encoding mode
+    pe_mode = config["model"].get("pe_mode", "rope")
+
+    # Build model config with PE-specific parameters
+    model_kwargs = {
+        "vocab_size": config["model"]["vocab_size"],
+        "hidden_dim": config["model"]["hidden_dim"],
+        "num_layers": config["model"]["num_layers"],
+        "num_heads": config["model"]["num_heads"],
+        "num_kv_heads": config["model"]["num_kv_heads"],
+        "head_dim": config["model"]["head_dim"],
+        "ffn_dim": config["model"]["ffn_dim"],
+        "ffn_multiple_of": config["model"]["ffn_multiple_of"],
+        "max_seq_len": config["model"]["max_seq_len"],
+        "norm_eps": config["model"]["norm_eps"],
+        "use_qk_norm": config["model"]["use_qk_norm"],
+        "dropout": config["model"]["dropout"],
+        "tie_embeddings": config["model"]["tie_embeddings"],
+        "gradient_checkpointing": config["model"]["gradient_checkpointing"],
+        "pe_mode": pe_mode,
+    }
+
+    if pe_mode == "rope":
+        # RoPE-specific parameters
+        model_kwargs.update({
+            "rope_theta": config["model"].get("rope_theta", 10000.0),
+            "rope_type": config["model"].get("rope_type", "default"),
+            "rope_scale": config["model"].get("rope_scale", 1.0),
+        })
+    elif pe_mode == "fpope":
+        # FPoPE-specific parameters
+        model_kwargs.update({
+            "fpope_theta": config["model"].get("fpope_theta", 10000.0),
+            "fpope_num_fourier_terms": config["model"].get("fpope_num_fourier_terms", 64),
+            "fpope_sigma": config["model"].get("fpope_sigma", 0.4),
+            "fpope_training_length": config["model"].get("fpope_training_length", 512),
+            "fpope_delta_init": config["model"].get("fpope_delta_init", "zero"),
+        })
+        print_rank0(f"Using FPoPE positional encoding with theta={model_kwargs['fpope_theta']}, "
+                    f"num_fourier_terms={model_kwargs['fpope_num_fourier_terms']}")
+
+    model_config = TransformerConfig(**model_kwargs)
 
     model = Transformer(model_config)
     model = model.to(device)

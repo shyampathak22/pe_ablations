@@ -19,6 +19,7 @@ from src.model.kernels.fpope_attention import (
     pytorch_fpope_attention,
     fpope_attention_forward,
     HAS_TRITON,
+    HAS_CUDA_KERNEL,
 )
 from src.model.transformer import Transformer, TransformerConfig
 
@@ -381,6 +382,129 @@ class TestFPoPEKernel:
         assert v.grad is not None and not torch.isnan(v.grad).any()
         assert freqs.grad is not None and not torch.isnan(freqs.grad).any()
         assert phase_bias.grad is not None and not torch.isnan(phase_bias.grad).any()
+
+
+class TestFPoPECUDAKernel:
+    """Tests for the native CUDA FPoPE attention kernel."""
+
+    @pytest.mark.skipif(not HAS_CUDA_KERNEL, reason="CUDA kernel not built")
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_forward_matches_pytorch(self):
+        """Test that CUDA kernel matches PyTorch implementation."""
+        batch, heads, seq, dim = 2, 8, 64, 64
+        device = "cuda"
+
+        q = torch.randn(batch, heads, seq, dim, device=device)
+        k = torch.randn(batch, heads, seq, dim, device=device)
+        v = torch.randn(batch, heads, seq, dim, device=device)
+        freqs = torch.randn(dim, device=device)
+        phase_bias = torch.randn(dim, device=device)
+
+        pytorch_out = pytorch_fpope_attention(q, k, v, freqs, phase_bias)
+
+        # Force CUDA path by using fpope_attention_forward (auto-dispatches)
+        cuda_out = fpope_attention_forward(q, k, v, freqs, phase_bias, use_triton=False)
+
+        torch.testing.assert_close(pytorch_out, cuda_out, rtol=1e-3, atol=1e-3)
+
+    @pytest.mark.skipif(not HAS_CUDA_KERNEL, reason="CUDA kernel not built")
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_head_dim_32(self):
+        """Test CUDA kernel with head_dim=32."""
+        batch, heads, seq, dim = 2, 8, 128, 32
+        device = "cuda"
+
+        q = torch.randn(batch, heads, seq, dim, device=device)
+        k = torch.randn(batch, heads, seq, dim, device=device)
+        v = torch.randn(batch, heads, seq, dim, device=device)
+        freqs = torch.randn(dim, device=device)
+        phase_bias = torch.randn(dim, device=device)
+
+        out = fpope_attention_forward(q, k, v, freqs, phase_bias)
+
+        assert out.shape == (batch, heads, seq, dim)
+        assert not torch.isnan(out).any()
+
+    @pytest.mark.skipif(not HAS_CUDA_KERNEL, reason="CUDA kernel not built")
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_head_dim_128(self):
+        """Test CUDA kernel with head_dim=128."""
+        batch, heads, seq, dim = 2, 4, 128, 128
+        device = "cuda"
+
+        q = torch.randn(batch, heads, seq, dim, device=device)
+        k = torch.randn(batch, heads, seq, dim, device=device)
+        v = torch.randn(batch, heads, seq, dim, device=device)
+        freqs = torch.randn(dim, device=device)
+        phase_bias = torch.randn(dim, device=device)
+
+        out = fpope_attention_forward(q, k, v, freqs, phase_bias)
+
+        assert out.shape == (batch, heads, seq, dim)
+        assert not torch.isnan(out).any()
+
+    @pytest.mark.skipif(not HAS_CUDA_KERNEL, reason="CUDA kernel not built")
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_backward_matches_pytorch(self):
+        """Test that CUDA backward kernel matches PyTorch backward."""
+        batch, heads, seq, dim = 2, 4, 32, 64
+        device = "cuda"
+
+        # Create inputs with requires_grad
+        q_cuda = torch.randn(batch, heads, seq, dim, device=device, requires_grad=True)
+        k_cuda = torch.randn(batch, heads, seq, dim, device=device, requires_grad=True)
+        v_cuda = torch.randn(batch, heads, seq, dim, device=device, requires_grad=True)
+        freqs_cuda = torch.randn(dim, device=device, requires_grad=True)
+        phase_bias_cuda = torch.randn(dim, device=device, requires_grad=True)
+
+        # Clone for PyTorch reference
+        q_pytorch = q_cuda.detach().clone().requires_grad_(True)
+        k_pytorch = k_cuda.detach().clone().requires_grad_(True)
+        v_pytorch = v_cuda.detach().clone().requires_grad_(True)
+        freqs_pytorch = freqs_cuda.detach().clone().requires_grad_(True)
+        phase_bias_pytorch = phase_bias_cuda.detach().clone().requires_grad_(True)
+
+        grad_output = torch.randn(batch, heads, seq, dim, device=device)
+
+        # CUDA forward + backward (via auto-dispatch)
+        cuda_out = fpope_attention_forward(
+            q_cuda, k_cuda, v_cuda, freqs_cuda, phase_bias_cuda, use_triton=False
+        )
+        cuda_out.backward(grad_output)
+
+        # PyTorch forward + backward
+        pytorch_out = pytorch_fpope_attention(
+            q_pytorch, k_pytorch, v_pytorch, freqs_pytorch, phase_bias_pytorch
+        )
+        pytorch_out.backward(grad_output)
+
+        # Compare gradients (with relaxed tolerances for numerical differences)
+        torch.testing.assert_close(q_cuda.grad, q_pytorch.grad, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(k_cuda.grad, k_pytorch.grad, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(v_cuda.grad, v_pytorch.grad, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(freqs_cuda.grad, freqs_pytorch.grad, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(phase_bias_cuda.grad, phase_bias_pytorch.grad, rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.skipif(not HAS_CUDA_KERNEL, reason="CUDA kernel not built")
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_longer_sequence(self):
+        """Test CUDA kernel with longer sequence (256 tokens)."""
+        batch, heads, seq, dim = 2, 4, 256, 64
+        device = "cuda"
+
+        q = torch.randn(batch, heads, seq, dim, device=device, requires_grad=True)
+        k = torch.randn(batch, heads, seq, dim, device=device, requires_grad=True)
+        v = torch.randn(batch, heads, seq, dim, device=device, requires_grad=True)
+        freqs = torch.randn(dim, device=device, requires_grad=True)
+        phase_bias = torch.randn(dim, device=device, requires_grad=True)
+
+        out = fpope_attention_forward(q, k, v, freqs, phase_bias)
+        loss = out.sum()
+        loss.backward()
+
+        assert out.shape == (batch, heads, seq, dim)
+        assert not torch.isnan(out).any()
+        assert q.grad is not None and not torch.isnan(q.grad).any()
 
 
 class TestFPoPEGroupedQueryAttention:

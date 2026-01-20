@@ -11,3 +11,7 @@ wheels/
 
 # Claude Code
 .claude/
+
+# kernels
+fpope_cuda.cpython-313-x86_64-linux-gnu.so
+cuda_12.8.0_570.86.10_linux.run

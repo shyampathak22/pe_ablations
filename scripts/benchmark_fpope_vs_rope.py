@@ -14,6 +14,7 @@ from src.model.kernels.fpope_attention import (
     triton_fpope_attention,
     triton_fpope_attention_backward,
     HAS_TRITON,
+    HAS_CUDA_KERNEL,
 )
 
 
@@ -107,6 +108,38 @@ def benchmark_config(batch, heads, seq, dim, n_warmup=3, n_iters=10):
     except Exception as e:
         results['fpope_triton_fwd_bwd'] = f"ERROR: {e}"
 
+    # ========== FPoPE CUDA Forward+Backward ==========
+    if HAS_CUDA_KERNEL:
+        try:
+            # Warmup
+            for _ in range(n_warmup):
+                q1 = q.detach().clone().requires_grad_(True)
+                k1 = k.detach().clone().requires_grad_(True)
+                v1 = v.detach().clone().requires_grad_(True)
+                f1 = freqs.detach().clone().requires_grad_(True)
+                b1 = bias.detach().clone().requires_grad_(True)
+                out = fpope_attention_forward(q1, k1, v1, f1, b1, use_triton=False)
+                out.backward(grad_out)
+            torch.cuda.synchronize()
+
+            # Timed runs
+            torch.cuda.synchronize()
+            start = time.time()
+            for _ in range(n_iters):
+                q1 = q.detach().clone().requires_grad_(True)
+                k1 = k.detach().clone().requires_grad_(True)
+                v1 = v.detach().clone().requires_grad_(True)
+                f1 = freqs.detach().clone().requires_grad_(True)
+                b1 = bias.detach().clone().requires_grad_(True)
+                out = fpope_attention_forward(q1, k1, v1, f1, b1, use_triton=False)
+                out.backward(grad_out)
+            torch.cuda.synchronize()
+            results['fpope_cuda_fwd_bwd'] = (time.time() - start) / n_iters * 1000
+        except Exception as e:
+            results['fpope_cuda_fwd_bwd'] = f"ERROR: {e}"
+    else:
+        results['fpope_cuda_fwd_bwd'] = "N/A"
+
     # ========== RoPE Forward+Backward ==========
     try:
         # Warmup
@@ -141,10 +174,11 @@ def benchmark_config(batch, heads, seq, dim, n_warmup=3, n_iters=10):
 
 
 def main():
-    print("=" * 70)
-    print("FPoPE (Triton) vs RoPE Benchmark")
-    print("=" * 70)
+    print("=" * 90)
+    print("FPoPE (CUDA/Triton) vs RoPE Benchmark")
+    print("=" * 90)
     print(f"Triton available: {HAS_TRITON}")
+    print(f"CUDA kernel available: {HAS_CUDA_KERNEL}")
     print(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
@@ -161,8 +195,8 @@ def main():
         (4, 8, 256, 64),
     ]
 
-    print(f"{'Config':<25} {'FPoPE Fwd':<12} {'FPoPE Fwd+Bwd':<15} {'RoPE Fwd+Bwd':<15} {'Ratio':<10}")
-    print("-" * 70)
+    print(f"{'Config':<22} {'CUDA Fwd+Bwd':<14} {'Triton Fwd+Bwd':<16} {'RoPE Fwd+Bwd':<14} {'CUDA/RoPE':<10} {'Triton/RoPE':<12}")
+    print("-" * 90)
 
     for batch, heads, seq, dim in configs:
         config_str = f"B={batch}, H={heads}, S={seq}, D={dim}"
@@ -170,29 +204,34 @@ def main():
         try:
             results = benchmark_config(batch, heads, seq, dim)
 
-            fpope_fwd = results.get('fpope_triton_fwd', 'N/A')
-            fpope_fwd_bwd = results.get('fpope_triton_fwd_bwd', 'N/A')
+            cuda_fwd_bwd = results.get('fpope_cuda_fwd_bwd', 'N/A')
+            triton_fwd_bwd = results.get('fpope_triton_fwd_bwd', 'N/A')
             rope_fwd_bwd = results.get('rope_fwd_bwd', 'N/A')
 
-            if isinstance(fpope_fwd_bwd, float) and isinstance(rope_fwd_bwd, float):
-                ratio = f"{fpope_fwd_bwd / rope_fwd_bwd:.1f}x"
+            if isinstance(cuda_fwd_bwd, float) and isinstance(rope_fwd_bwd, float):
+                cuda_ratio = f"{cuda_fwd_bwd / rope_fwd_bwd:.1f}x"
             else:
-                ratio = "N/A"
+                cuda_ratio = "N/A"
 
-            fpope_fwd_str = f"{fpope_fwd:.2f}ms" if isinstance(fpope_fwd, float) else str(fpope_fwd)[:10]
-            fpope_fwd_bwd_str = f"{fpope_fwd_bwd:.2f}ms" if isinstance(fpope_fwd_bwd, float) else str(fpope_fwd_bwd)[:12]
-            rope_fwd_bwd_str = f"{rope_fwd_bwd:.2f}ms" if isinstance(rope_fwd_bwd, float) else str(rope_fwd_bwd)[:12]
+            if isinstance(triton_fwd_bwd, float) and isinstance(rope_fwd_bwd, float):
+                triton_ratio = f"{triton_fwd_bwd / rope_fwd_bwd:.1f}x"
+            else:
+                triton_ratio = "N/A"
 
-            print(f"{config_str:<25} {fpope_fwd_str:<12} {fpope_fwd_bwd_str:<15} {rope_fwd_bwd_str:<15} {ratio:<10}")
+            cuda_str = f"{cuda_fwd_bwd:.2f}ms" if isinstance(cuda_fwd_bwd, float) else str(cuda_fwd_bwd)[:12]
+            triton_str = f"{triton_fwd_bwd:.2f}ms" if isinstance(triton_fwd_bwd, float) else str(triton_fwd_bwd)[:14]
+            rope_str = f"{rope_fwd_bwd:.2f}ms" if isinstance(rope_fwd_bwd, float) else str(rope_fwd_bwd)[:12]
+
+            print(f"{config_str:<22} {cuda_str:<14} {triton_str:<16} {rope_str:<14} {cuda_ratio:<10} {triton_ratio:<12}")
 
         except torch.cuda.OutOfMemoryError:
-            print(f"{config_str:<25} OOM")
+            print(f"{config_str:<22} OOM")
             torch.cuda.empty_cache()
             gc.collect()
         except Exception as e:
-            print(f"{config_str:<25} ERROR: {e}")
+            print(f"{config_str:<22} ERROR: {e}")
 
-    print("=" * 70)
+    print("=" * 90)
 
 
 if __name__ == "__main__":

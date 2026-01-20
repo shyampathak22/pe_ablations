@@ -10,7 +10,10 @@ This requires:
 2. Phase computation from position differences
 3. Cosine modulation of the magnitude product
 
-Provides both Triton-optimized and pure PyTorch implementations.
+Provides implementations in order of preference:
+1. Native CUDA kernels (fastest, 15-25% MFU)
+2. Triton kernels (slower due to 3D tensor compilation overhead)
+3. Pure PyTorch (reference implementation)
 """
 
 import math
@@ -19,6 +22,14 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from torch.autograd import Function
+
+# Try to import native CUDA kernel (built via setup.py)
+try:
+    import fpope_cuda
+    HAS_CUDA_KERNEL = True
+except ImportError:
+    HAS_CUDA_KERNEL = False
+    fpope_cuda = None
 
 # Try to import Triton
 try:
@@ -882,8 +893,148 @@ def triton_fpope_attention_backward(
     return dq, dk, dv, dfreq, dbias
 
 
+# =============================================================================
+# Native CUDA Kernel Wrappers
+# =============================================================================
+
+def cuda_fpope_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    freqs: torch.Tensor,
+    phase_bias: torch.Tensor,
+    start_pos: int = 0,
+    scale: Optional[float] = None,
+    return_lse: bool = False,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Native CUDA FPoPE attention forward pass.
+
+    Args:
+        q: Query tensor (batch, heads, seq_q, dim)
+        k: Key tensor (batch, heads, seq_k, dim)
+        v: Value tensor (batch, heads, seq_k, dim)
+        freqs: Effective frequencies (dim,)
+        phase_bias: Phase bias (dim,)
+        start_pos: Starting position for KV-cache
+        scale: Attention scale factor
+        return_lse: Whether to return logsumexp for backward
+
+    Returns:
+        Tuple of (output, lse) where lse is None if not requested
+    """
+    if not HAS_CUDA_KERNEL:
+        raise RuntimeError("CUDA kernel not available. Build with: uv run python setup.py build_ext --inplace")
+
+    batch, heads, seq_q, dim = q.shape
+    seq_k = k.shape[2]
+
+    if scale is None:
+        scale = 1.0 / math.sqrt(dim)
+
+    # Check dimension support
+    if dim not in (32, 64, 128):
+        # Fall back to Triton or PyTorch for unsupported dimensions
+        if HAS_TRITON:
+            return triton_fpope_attention(q, k, v, freqs, phase_bias, start_pos, scale, return_lse)
+        else:
+            out = pytorch_fpope_attention(q, k, v, freqs, phase_bias, start_pos, scale, causal=True)
+            return (out, None) if return_lse else out
+
+    # Precompute softplus in PyTorch
+    mu_q = F.softplus(q)
+    mu_k = F.softplus(k)
+
+    # Reshape for kernel: (batch, heads, seq, dim) -> (batch*heads, seq, dim)
+    mu_q_flat = mu_q.reshape(batch * heads, seq_q, dim).contiguous()
+    mu_k_flat = mu_k.reshape(batch * heads, seq_k, dim).contiguous()
+    v_flat = v.reshape(batch * heads, seq_k, dim).contiguous()
+
+    # Call CUDA kernel
+    results = fpope_cuda.forward(
+        mu_q_flat, mu_k_flat, v_flat,
+        freqs.contiguous(), phase_bias.contiguous(),
+        start_pos, scale, return_lse
+    )
+
+    output = results[0].reshape(batch, heads, seq_q, dim)
+
+    if return_lse and len(results) > 1:
+        lse = results[1]  # (batch*heads, seq_q)
+        return output, lse
+    return output, None
+
+
+def cuda_fpope_attention_backward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    freqs: torch.Tensor,
+    phase_bias: torch.Tensor,
+    output: torch.Tensor,
+    grad_output: torch.Tensor,
+    lse: torch.Tensor,
+    start_pos: int = 0,
+    scale: Optional[float] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Native CUDA FPoPE attention backward pass.
+
+    Returns:
+        Tuple of (dq, dk, dv, dfreqs, dphase_bias)
+    """
+    if not HAS_CUDA_KERNEL:
+        return None
+
+    batch, heads, seq_q, dim = q.shape
+    seq_k = k.shape[2]
+
+    if scale is None:
+        scale = 1.0 / math.sqrt(dim)
+
+    # Check dimension support
+    if dim not in (32, 64, 128):
+        return None  # Signal to fall back
+
+    # Precompute softplus and sigmoid
+    mu_q = F.softplus(q)
+    mu_k = F.softplus(k)
+    sigmoid_q = torch.sigmoid(q)
+    sigmoid_k = torch.sigmoid(k)
+
+    # Reshape for kernel
+    mu_q_flat = mu_q.reshape(batch * heads, seq_q, dim).contiguous()
+    mu_k_flat = mu_k.reshape(batch * heads, seq_k, dim).contiguous()
+    v_flat = v.reshape(batch * heads, seq_k, dim).contiguous()
+    output_flat = output.reshape(batch * heads, seq_q, dim).contiguous()
+    grad_output_flat = grad_output.reshape(batch * heads, seq_q, dim).contiguous()
+    sigmoid_q_flat = sigmoid_q.reshape(batch * heads, seq_q, dim).contiguous()
+    sigmoid_k_flat = sigmoid_k.reshape(batch * heads, seq_k, dim).contiguous()
+
+    # Call CUDA kernel
+    results = fpope_cuda.backward(
+        mu_q_flat, mu_k_flat, v_flat,
+        freqs.contiguous(), phase_bias.contiguous(),
+        output_flat, grad_output_flat, lse,
+        sigmoid_q_flat, sigmoid_k_flat,
+        start_pos, scale
+    )
+
+    dq = results[0].reshape(batch, heads, seq_q, dim)
+    dk = results[1].reshape(batch, heads, seq_k, dim)
+    dv = results[2].reshape(batch, heads, seq_k, dim)
+    dfreq = results[3]
+    dbias = results[4]
+
+    return dq, dk, dv, dfreq, dbias
+
+
 class FPoPEAttentionFunction(Function):
-    """Autograd function for FPoPE attention with custom backward."""
+    """Autograd function for FPoPE attention with custom backward.
+
+    Dispatch priority:
+    1. Native CUDA kernel (fastest)
+    2. Triton kernel (slower due to 3D tensor JIT compilation)
+    3. PyTorch reference (slowest but always works)
+    """
 
     @staticmethod
     def forward(
@@ -900,15 +1051,24 @@ class FPoPEAttentionFunction(Function):
     ) -> torch.Tensor:
         """Forward pass."""
         lse = None
-        if use_triton and HAS_TRITON and q.is_cuda:
+        use_cuda = False
+
+        # Priority 1: Native CUDA kernel
+        if HAS_CUDA_KERNEL and q.is_cuda and q.shape[-1] in (32, 64, 128):
+            output, lse = cuda_fpope_attention(
+                q, k, v, freqs, phase_bias, start_pos, scale, return_lse=True
+            )
+            use_cuda = True
+        # Priority 2: Triton kernel
+        elif use_triton and HAS_TRITON and q.is_cuda:
             result = triton_fpope_attention(
                 q, k, v, freqs, phase_bias, start_pos, scale, return_lse=True
             )
-            # Handle both tuple return (triton with lse) and single tensor return (fallback)
             if isinstance(result, tuple):
                 output, lse = result
             else:
                 output = result
+        # Priority 3: PyTorch reference
         else:
             output = pytorch_fpope_attention(
                 q, k, v, freqs, phase_bias, start_pos, scale, causal
@@ -920,16 +1080,28 @@ class FPoPEAttentionFunction(Function):
         ctx.scale = scale
         ctx.causal = causal
         ctx.use_triton = use_triton
-        ctx.lse = lse  # Save LSE for Triton backward (may be None)
+        ctx.use_cuda = use_cuda
+        ctx.lse = lse  # Save LSE for backward (may be None)
 
         return output
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        """Backward pass - uses Triton kernel when available, PyTorch fallback otherwise."""
+        """Backward pass - uses CUDA > Triton > PyTorch fallback."""
         q, k, v, freqs, phase_bias, output = ctx.saved_tensors
 
-        # Try Triton backward first if we have LSE
+        # Priority 1: Native CUDA backward
+        if ctx.use_cuda and HAS_CUDA_KERNEL and ctx.lse is not None:
+            result = cuda_fpope_attention_backward(
+                q, k, v, freqs, phase_bias,
+                output, grad_output, ctx.lse,
+                ctx.start_pos, ctx.scale
+            )
+            if result is not None:
+                dq, dk, dv, dfreqs, dphase_bias = result
+                return dq, dk, dv, dfreqs, dphase_bias, None, None, None, None
+
+        # Priority 2: Triton backward
         if ctx.use_triton and HAS_TRITON and ctx.lse is not None and q.is_cuda:
             result = triton_fpope_attention_backward(
                 q, k, v, freqs, phase_bias,
@@ -940,7 +1112,7 @@ class FPoPEAttentionFunction(Function):
                 dq, dk, dv, dfreqs, dphase_bias = result
                 return dq, dk, dv, dfreqs, dphase_bias, None, None, None, None
 
-        # Fall back to PyTorch autograd
+        # Priority 3: PyTorch autograd fallback
         with torch.enable_grad():
             q = q.detach().requires_grad_(True)
             k = k.detach().requires_grad_(True)
