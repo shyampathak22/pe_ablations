@@ -48,6 +48,7 @@ class TransformerConfig:
     fpope_sigma: float = 0.4
     fpope_training_length: int = 512  # For floor frequency clipping
     fpope_delta_init: str = "zero"  # "zero" for length gen, "uniform" for in-distribution
+    fpope_d_rope: int = 32  # Dimension for position encoding portion (PoPE doubles this)
 
     # Normalization
     norm_eps: float = 1e-6
@@ -113,12 +114,13 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(config.hidden_dim, eps=config.norm_eps)
 
         if config.pe_mode == "fpope":
-            # Use FPoPE-aware attention
+            # Use FPoPE-aware attention with content + position split
             self.attention = FPoPEGroupedQueryAttention(
                 hidden_dim=config.hidden_dim,
                 num_heads=config.num_heads,
                 num_kv_heads=config.num_kv_heads,
                 head_dim=config.head_dim,
+                d_rope=config.fpope_d_rope,  # Position portion dimension
                 use_qk_norm=config.use_qk_norm,
                 fpope=fpope,
             )
@@ -231,9 +233,9 @@ class Transformer(nn.Module):
             else:
                 raise ValueError(f"Unknown rope_type: {config.rope_type}")
         elif config.pe_mode == "fpope":
-            # FoPE+PoPE combined encoding
+            # FoPE+PoPE combined encoding - uses fpope_d_rope for position portion
             self.fpope = FoPEPoPEEmbedding(
-                dim=config.head_dim,
+                dim=config.fpope_d_rope,  # Position encoding dimension (PoPE doubles this)
                 max_seq_len=config.max_seq_len,
                 theta=config.fpope_theta,
                 num_fourier_terms=config.fpope_num_fourier_terms,

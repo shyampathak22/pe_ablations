@@ -1,37 +1,57 @@
-"""FPoPE-aware Grouped Query Attention.
+"""FPoPE-aware Grouped Query Attention with Content+Position Split.
 
-This module provides a GQA implementation that uses FoPE+PoPE positional encoding
-instead of standard RoPE. The key difference is that position information is
-encoded in the attention score computation via cosine phases, rather than
-being applied to Q/K before the dot product.
+This module implements the Cinnamon-style architecture where:
+- Content path: Standard projections with NO positional encoding
+- Position path: Projections with PoPE (Polar Position Embedding) applied
+- Final attention: Concatenate content + position, use standard dot-product
+
+Key insight: After the PoPE transform (softplus → cos/sin), we get:
+  q = concat(q_c, q_r)  # Content + Position
+  k = concat(k_c, k_r)
+  score = q @ k.T = q_c @ k_c.T + q_r @ k_r.T
+
+This allows us to use standard attention mechanisms (including Flash Attention)
+instead of custom kernels, while still having position-aware attention.
+
+References:
+- Cinnamon PoPE: /home/hyperion/code/projects/cinnamon/src/attention.py
+- PoPE paper: Polar Position Embedding for Length Generalization
 """
 
 import torch
 import torch.nn as nn
-from einops import rearrange
+import torch.nn.functional as F
 
 from src.model.fpope import FoPEPoPEEmbedding
-from src.model.normalization import QKNorm
-from src.model.kernels.fpope_attention import fpope_attention_forward
+from src.model.normalization import RMSNorm
 
 
 class FPoPEGroupedQueryAttention(nn.Module):
-    """Grouped Query Attention with FoPE+PoPE positional encoding.
+    """Grouped Query Attention with FoPE+PoPE using content+position split.
 
-    Unlike standard GQA which applies RoPE to Q/K before attention,
-    FPoPE-GQA computes attention scores using:
-        a_{t,s} = Σ_c softplus(q_{t,c}) × softplus(k_{s,c}) × cos((s-t)×ω_c + δ_c)
+    Architecture (following Cinnamon):
+    - Content projections (wq_c, wk_c): Standard Q/K with NO positional encoding
+    - Position projections (wq_r, wk_r): Q/K with PoPE (softplus → cos/sin)
+    - Normalization (qr_norm, kr_norm): Applied before PoPE for stability
+    - Value projection (wv): Full head_dim
+    - Output projection (wo): d_content + d_rope*2 → hidden_dim
 
-    This decouples content (magnitudes from softplus) from position (phases from cos).
+    The final query/key are:
+        q = concat(q_c, q_r)  where q_r = PoPE(wq_r(x)) → 2*d_rope dims
+        k = concat(k_c, k_r)  where k_r = PoPE(wk_r(x)) → 2*d_rope dims
+
+    Attention score = (q_c @ k_c.T + q_r @ k_r.T) / sqrt(d_content + 2*d_rope)
+
+    This is just standard dot-product attention after concatenation!
 
     Args:
         hidden_dim: Model hidden dimension
         num_heads: Number of query attention heads
         num_kv_heads: Number of key/value attention heads (for GQA)
-        head_dim: Dimension per attention head
-        use_qk_norm: Whether to apply QKNorm (applied before softplus)
+        head_dim: Dimension per attention head (for content path)
+        d_rope: Dimension for position encoding (PoPE doubles this to 2*d_rope)
+        use_qk_norm: Whether to apply RMSNorm to position projections
         fpope: FoPEPoPEEmbedding module for frequency/phase computation
-        use_triton: Whether to use Triton kernel when available
     """
 
     def __init__(
@@ -39,34 +59,52 @@ class FPoPEGroupedQueryAttention(nn.Module):
         hidden_dim: int,
         num_heads: int,
         num_kv_heads: int,
-        head_dim: int | None = None,
+        head_dim: int = 64,
+        d_rope: int = 32,
         use_qk_norm: bool = True,
         fpope: FoPEPoPEEmbedding | None = None,
-        use_triton: bool = True,
     ):
         super().__init__()
 
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
-        self.head_dim = head_dim or (hidden_dim // num_heads)
+        self.head_dim = head_dim
+        self.d_rope = d_rope
+        self.d_content = head_dim  # Content uses full head_dim
         self.num_groups = num_heads // num_kv_heads
-        self.use_triton = use_triton
 
         assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
 
-        # Linear projections
-        self.wq = nn.Linear(hidden_dim, num_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(hidden_dim, num_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(hidden_dim, num_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(num_heads * self.head_dim, hidden_dim, bias=False)
+        # Content projections (NO positional encoding applied)
+        self.wq_c = nn.Linear(hidden_dim, num_heads * self.d_content, bias=False)
+        self.wk_c = nn.Linear(hidden_dim, num_kv_heads * self.d_content, bias=False)
 
-        # QKNorm is applied before softplus in FPoPE
-        # This helps stabilize the magnitude computation
-        self.qk_norm = QKNorm(self.head_dim) if use_qk_norm else None
+        # Position projections (PoPE applied here)
+        self.wq_r = nn.Linear(hidden_dim, num_heads * d_rope, bias=False)
+        self.wk_r = nn.Linear(hidden_dim, num_kv_heads * d_rope, bias=False)
+
+        # Normalization before PoPE (critical for stability, following Cinnamon)
+        if use_qk_norm:
+            self.qr_norm = RMSNorm(num_heads * d_rope)
+            self.kr_norm = RMSNorm(num_kv_heads * d_rope)
+        else:
+            self.qr_norm = None
+            self.kr_norm = None
+
+        # Value uses full head_dim
+        self.wv = nn.Linear(hidden_dim, num_kv_heads * head_dim, bias=False)
+
+        # Output projection: based on value dimension (head_dim), not query/key dimension
+        # The concatenation of content+position is only for query/key scoring
+        # Value and output use standard head_dim
+        self.wo = nn.Linear(num_heads * head_dim, hidden_dim, bias=False)
 
         # FoPE+PoPE embedding
         self.fpope = fpope
+
+        # Attention scale: based on full query/key dimension
+        self.scale = (self.d_content + d_rope * 2) ** -0.5
 
     def forward(
         self,
@@ -84,61 +122,67 @@ class FPoPEGroupedQueryAttention(nn.Module):
         Returns:
             Output tensor of shape (batch, seq_len, hidden_dim)
         """
-        batch_size, seq_len, _ = x.shape
+        B, S, _ = x.shape
 
-        # Project to Q, K, V
-        q = self.wq(x)
-        k = self.wk(x)
-        v = self.wv(x)
+        # Content projections (standard attention, no PE)
+        q_c = self.wq_c(x).view(B, S, self.num_heads, self.d_content).transpose(1, 2)
+        k_c = self.wk_c(x).view(B, S, self.num_kv_heads, self.d_content).transpose(1, 2)
 
-        # Reshape to (batch, seq, heads, dim)
-        q = rearrange(q, "b s (h d) -> b s h d", h=self.num_heads)
-        k = rearrange(k, "b s (h d) -> b s h d", h=self.num_kv_heads)
-        v = rearrange(v, "b s (h d) -> b s h d", h=self.num_kv_heads)
+        # Position projections with normalization
+        q_r_proj = self.wq_r(x)
+        k_r_proj = self.wk_r(x)
 
-        # Reshape to (batch, heads, seq, dim) for attention
-        q = rearrange(q, "b s h d -> b h s d")
-        k = rearrange(k, "b s h d -> b h s d")
-        v = rearrange(v, "b s h d -> b h s d")
+        if self.qr_norm is not None:
+            q_r_proj = self.qr_norm(q_r_proj)
+            k_r_proj = self.kr_norm(k_r_proj)
 
-        # Apply QKNorm before the softplus (if enabled)
-        # This normalizes the raw projections before magnitude computation
-        if self.qk_norm is not None:
-            q, k = self.qk_norm(q, k)
+        q_r = q_r_proj.view(B, S, self.num_heads, self.d_rope)
+        k_r = k_r_proj.view(B, S, self.num_kv_heads, self.d_rope)
 
-        # Expand KV heads for GQA
+        # Apply PoPE transform via forward_query/forward_key
+        # Query: [μ·cos(t×θ), μ·sin(t×θ)] - no delta
+        # Key:   [μ·cos(s×θ+δ), μ·sin(s×θ+δ)] - with delta
+        if self.fpope is not None:
+            q_r = self.fpope.forward_query(q_r, start_pos)  # (B, S, H, d_rope*2)
+            k_r = self.fpope.forward_key(k_r, start_pos)    # (B, S, Hkv, d_rope*2)
+        else:
+            # Fallback: no PoPE, just duplicate dimensions (for testing)
+            q_r = torch.cat([q_r, q_r], dim=-1)
+            k_r = torch.cat([k_r, k_r], dim=-1)
+
+        q_r = q_r.transpose(1, 2)  # (B, H, S, d_rope*2)
+        k_r = k_r.transpose(1, 2)
+
+        # Value
+        v = self.wv(x).view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # GQA expansion: repeat K/V for each query group
         if self.num_groups > 1:
-            k = k.repeat_interleave(self.num_groups, dim=1)
+            k_c = k_c.repeat_interleave(self.num_groups, dim=1)
+            k_r = k_r.repeat_interleave(self.num_groups, dim=1)
             v = v.repeat_interleave(self.num_groups, dim=1)
 
-        # Get frequencies and phase bias from FoPE-PoPE
-        if self.fpope is not None:
-            effective_freqs = self.fpope._compute_effective_freqs()
-            phase_bias = self.fpope.phase_bias
-        else:
-            # Fallback: use default frequencies (like standard RoPE)
-            effective_freqs = torch.ones(self.head_dim, device=x.device)
-            phase_bias = torch.zeros(self.head_dim, device=x.device)
+        # Concatenate content + position
+        q = torch.cat([q_c, q_r], dim=-1)  # (B, H, S, d_content + d_rope*2)
+        k = torch.cat([k_c, k_r], dim=-1)
 
-        # Compute FPoPE attention
-        # Note: softplus is applied inside the attention kernel
-        attn_output = fpope_attention_forward(
-            q=q,
-            k=k,
-            v=v,
-            freqs=effective_freqs,
-            phase_bias=phase_bias,
-            start_pos=start_pos,
-            scale=1.0 / (self.head_dim ** 0.5),
-            causal=(mask is None),
-            use_triton=self.use_triton,
+        # Standard scaled dot-product attention (no custom kernel!)
+        # This can use Flash Attention via PyTorch's SDPA
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+        # Causal mask
+        causal_mask = torch.triu(
+            torch.ones(S, S, device=x.device, dtype=torch.bool),
+            diagonal=1
         )
+        scores = scores.masked_fill(causal_mask, float('-inf'))
 
-        # Reshape back to (batch, seq, heads * dim)
-        attn_output = rearrange(attn_output, "b h s d -> b s (h d)")
+        attn_probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(v.dtype)
+        output = torch.matmul(attn_probs, v)
 
-        # Output projection
-        return self.wo(attn_output)
+        # Reshape and project output
+        output = output.transpose(1, 2).contiguous().view(B, S, -1)
+        return self.wo(output)
 
 
 class FPoPEGroupedQueryAttentionWithCache(FPoPEGroupedQueryAttention):
@@ -153,10 +197,10 @@ class FPoPEGroupedQueryAttentionWithCache(FPoPEGroupedQueryAttention):
         hidden_dim: int,
         num_heads: int,
         num_kv_heads: int,
-        head_dim: int | None = None,
+        head_dim: int = 64,
+        d_rope: int = 32,
         use_qk_norm: bool = True,
         fpope: FoPEPoPEEmbedding | None = None,
-        use_triton: bool = True,
         max_cache_len: int = 2048,
     ):
         super().__init__(
@@ -164,14 +208,15 @@ class FPoPEGroupedQueryAttentionWithCache(FPoPEGroupedQueryAttention):
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
+            d_rope=d_rope,
             use_qk_norm=use_qk_norm,
             fpope=fpope,
-            use_triton=use_triton,
         )
 
         self.max_cache_len = max_cache_len
 
         # KV cache buffers (will be initialized on first forward)
+        # Note: We cache the concatenated (content + position) keys
         self.register_buffer("k_cache", None, persistent=False)
         self.register_buffer("v_cache", None, persistent=False)
         self.cache_len = 0
@@ -203,75 +248,82 @@ class FPoPEGroupedQueryAttentionWithCache(FPoPEGroupedQueryAttention):
         if not use_cache:
             return super().forward(x, mask, start_pos)
 
-        batch_size, seq_len, _ = x.shape
+        B, S, _ = x.shape
 
-        # Project Q, K, V
-        q = self.wq(x)
-        k = self.wk(x)
-        v = self.wv(x)
+        # Content projections
+        q_c = self.wq_c(x).view(B, S, self.num_heads, self.d_content).transpose(1, 2)
+        k_c = self.wk_c(x).view(B, S, self.num_kv_heads, self.d_content).transpose(1, 2)
 
-        # Reshape
-        q = rearrange(q, "b s (h d) -> b h s d", h=self.num_heads)
-        k = rearrange(k, "b s (h d) -> b h s d", h=self.num_kv_heads)
-        v = rearrange(v, "b s (h d) -> b h s d", h=self.num_kv_heads)
+        # Position projections with normalization
+        q_r_proj = self.wq_r(x)
+        k_r_proj = self.wk_r(x)
 
-        # Apply QKNorm
-        if self.qk_norm is not None:
-            q, k = self.qk_norm(q, k)
+        if self.qr_norm is not None:
+            q_r_proj = self.qr_norm(q_r_proj)
+            k_r_proj = self.kr_norm(k_r_proj)
+
+        q_r = q_r_proj.view(B, S, self.num_heads, self.d_rope)
+        k_r = k_r_proj.view(B, S, self.num_kv_heads, self.d_rope)
+
+        # Apply PoPE transform
+        if self.fpope is not None:
+            q_r = self.fpope.forward_query(q_r, start_pos)
+            k_r = self.fpope.forward_key(k_r, start_pos)
+        else:
+            q_r = torch.cat([q_r, q_r], dim=-1)
+            k_r = torch.cat([k_r, k_r], dim=-1)
+
+        q_r = q_r.transpose(1, 2)
+        k_r = k_r.transpose(1, 2)
+
+        # Value
+        v = self.wv(x).view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # Concatenate content + position for keys
+        k_new = torch.cat([k_c, k_r], dim=-1)  # (B, Hkv, S, d_content + d_rope*2)
 
         # Initialize cache if needed
+        key_dim = self.d_content + self.d_rope * 2
         if self.k_cache is None:
             self.k_cache = torch.zeros(
-                batch_size,
-                self.num_kv_heads,
-                self.max_cache_len,
-                self.head_dim,
-                dtype=k.dtype,
-                device=k.device,
+                B, self.num_kv_heads, self.max_cache_len, key_dim,
+                dtype=k_new.dtype, device=k_new.device,
             )
             self.v_cache = torch.zeros(
-                batch_size,
-                self.num_kv_heads,
-                self.max_cache_len,
-                self.head_dim,
-                dtype=v.dtype,
-                device=v.device,
+                B, self.num_kv_heads, self.max_cache_len, self.head_dim,
+                dtype=v.dtype, device=v.device,
             )
 
         # Update cache
-        self.k_cache[:, :, start_pos : start_pos + seq_len] = k
-        self.v_cache[:, :, start_pos : start_pos + seq_len] = v
-        self.cache_len = start_pos + seq_len
+        self.k_cache[:, :, start_pos:start_pos + S] = k_new
+        self.v_cache[:, :, start_pos:start_pos + S] = v
+        self.cache_len = start_pos + S
 
         # Get cached K, V
-        k = self.k_cache[:, :, : self.cache_len]
-        v = self.v_cache[:, :, : self.cache_len]
+        k = self.k_cache[:, :, :self.cache_len]
+        v = self.v_cache[:, :, :self.cache_len]
 
-        # Expand for GQA
+        # GQA expansion
         if self.num_groups > 1:
             k = k.repeat_interleave(self.num_groups, dim=1)
             v = v.repeat_interleave(self.num_groups, dim=1)
 
-        # Get frequencies and phase bias
-        if self.fpope is not None:
-            effective_freqs = self.fpope._compute_effective_freqs()
-            phase_bias = self.fpope.phase_bias
-        else:
-            effective_freqs = torch.ones(self.head_dim, device=x.device)
-            phase_bias = torch.zeros(self.head_dim, device=x.device)
+        # Concatenate query content + position
+        q = torch.cat([q_c, q_r], dim=-1)
 
-        # Compute attention
-        attn_output = fpope_attention_forward(
-            q=q,
-            k=k,
-            v=v,
-            freqs=effective_freqs,
-            phase_bias=phase_bias,
-            start_pos=start_pos,
-            scale=1.0 / (self.head_dim ** 0.5),
-            causal=True,
-            use_triton=self.use_triton,
+        # Attention
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+        # Causal mask for cached attention
+        total_len = k.shape[2]
+        causal_mask = torch.triu(
+            torch.ones(S, total_len, device=x.device, dtype=torch.bool),
+            diagonal=total_len - S + 1
         )
+        scores = scores.masked_fill(causal_mask, float('-inf'))
 
-        attn_output = rearrange(attn_output, "b h s d -> b s (h d)")
-        return self.wo(attn_output)
+        attn_probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(v.dtype)
+        output = torch.matmul(attn_probs, v)
+
+        output = output.transpose(1, 2).contiguous().view(B, S, -1)
+        return self.wo(output)

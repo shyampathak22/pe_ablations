@@ -234,6 +234,80 @@ class FoPEPoPEEmbedding(nn.Module):
         self.register_buffer("positions", positions, persistent=False)
         self.max_seq_len = new_max_seq_len
 
+    def forward_query(self, x: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+        """Apply PoPE to query (no delta bias).
+
+        Following Cinnamon's PoPE architecture:
+        Query at position t: [μ·cos(t×θ), μ·sin(t×θ)]
+
+        Args:
+            x: (B, S, H, d_rope) - position portion of query after projection
+            start_pos: Starting position for inference
+
+        Returns:
+            (B, S, H, d_rope*2) - [μ·cos(t×θ), μ·sin(t×θ)]
+        """
+        B, S, H, D = x.shape
+
+        # Magnitude from softplus (content-dependent)
+        mu = F.softplus(x)  # (B, S, H, D)
+
+        # Positions
+        pos = torch.arange(start_pos, start_pos + S, device=x.device, dtype=x.dtype)
+
+        # Effective frequencies with FoPE mixing
+        freqs = self._compute_effective_freqs()  # (D,)
+
+        # Phases: t × θ (no delta for queries)
+        phases = pos[:, None] * freqs[None, :]  # (S, D)
+        phases = phases.view(1, S, 1, D)  # Broadcast over batch and heads
+
+        # Polar to Cartesian
+        cos_out = mu * phases.cos()
+        sin_out = mu * phases.sin()
+
+        return torch.cat([cos_out, sin_out], dim=-1)  # (B, S, H, D*2)
+
+    def forward_key(self, x: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+        """Apply PoPE to key (with delta bias).
+
+        Following Cinnamon's PoPE architecture:
+        Key at position s: [μ·cos(s×θ+δ), μ·sin(s×θ+δ)]
+
+        The delta bias allows keys to shift their phase relative to queries,
+        which helps the model learn relative position patterns.
+
+        Args:
+            x: (B, S, H, d_rope) - position portion of key after projection
+            start_pos: Starting position for inference
+
+        Returns:
+            (B, S, H, d_rope*2) - [μ·cos(s×θ+δ), μ·sin(s×θ+δ)]
+        """
+        B, S, H, D = x.shape
+
+        # Magnitude from softplus
+        mu = F.softplus(x)
+
+        # Positions
+        pos = torch.arange(start_pos, start_pos + S, device=x.device, dtype=x.dtype)
+
+        # Effective frequencies with FoPE mixing
+        freqs = self._compute_effective_freqs()  # (D,)
+
+        # Clamp delta to [-2π, 0] for stable training
+        delta = self.phase_bias.clamp(-2 * math.pi, 0.0)
+
+        # Phases: s × θ + δ (with delta for keys)
+        phases = pos[:, None] * freqs[None, :] + delta[None, :]  # (S, D)
+        phases = phases.view(1, S, 1, D)
+
+        # Polar to Cartesian
+        cos_out = mu * phases.cos()
+        sin_out = mu * phases.sin()
+
+        return torch.cat([cos_out, sin_out], dim=-1)  # (B, S, H, D*2)
+
 
 def pope_attention_scores(
     mu_q: torch.Tensor,

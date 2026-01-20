@@ -9,7 +9,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 source "$PROJECT_DIR/setup_env.sh"
 
-CONTEXT_LENGTHS="512 1024 2048 4096 8192 16384"
+CONTEXT_LENGTHS="512 1024 2048 4096 8192"
 
 # Models to evaluate
 MODELS=(nope alibi rope_baseline rope_ntk rope_yarn fpope)

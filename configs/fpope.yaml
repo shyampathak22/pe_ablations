@@ -32,6 +32,7 @@ model:
   fpope_sigma: 0.4               # Fourier coefficient initialization variance
   fpope_training_length: 512     # Floor frequency = 2pi/512 (must match max_seq_len)
   fpope_delta_init: zero         # Zero init for length generalization
+  fpope_d_rope: 32               # Position encoding dimension (PoPE doubles to 64)
 
   # Normalization
   norm_eps: 1.0e-6
