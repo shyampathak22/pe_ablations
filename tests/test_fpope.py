@@ -315,6 +315,73 @@ class TestFPoPEKernel:
         assert not torch.isnan(triton_out).any()
         assert triton_out.shape == (batch, heads, seq, dim)
 
+    @pytest.mark.skipif(not HAS_TRITON, reason="Triton not available")
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_triton_backward_matches_pytorch(self):
+        """Test that Triton backward kernel matches PyTorch backward."""
+        batch, heads, seq, dim = 2, 4, 32, 64
+        device = "cuda"
+
+        # Create inputs with requires_grad
+        q_triton = torch.randn(batch, heads, seq, dim, device=device, requires_grad=True)
+        k_triton = torch.randn(batch, heads, seq, dim, device=device, requires_grad=True)
+        v_triton = torch.randn(batch, heads, seq, dim, device=device, requires_grad=True)
+        freqs_triton = torch.randn(dim, device=device, requires_grad=True)
+        phase_bias_triton = torch.randn(dim, device=device, requires_grad=True)
+
+        # Clone for PyTorch
+        q_pytorch = q_triton.detach().clone().requires_grad_(True)
+        k_pytorch = k_triton.detach().clone().requires_grad_(True)
+        v_pytorch = v_triton.detach().clone().requires_grad_(True)
+        freqs_pytorch = freqs_triton.detach().clone().requires_grad_(True)
+        phase_bias_pytorch = phase_bias_triton.detach().clone().requires_grad_(True)
+
+        # Same grad_output for both
+        grad_output = torch.randn(batch, heads, seq, dim, device=device)
+
+        # Triton forward + backward
+        triton_out = fpope_attention_forward(
+            q_triton, k_triton, v_triton, freqs_triton, phase_bias_triton, use_triton=True
+        )
+        triton_out.backward(grad_output)
+
+        # PyTorch forward + backward
+        pytorch_out = fpope_attention_forward(
+            q_pytorch, k_pytorch, v_pytorch, freqs_pytorch, phase_bias_pytorch, use_triton=False
+        )
+        pytorch_out.backward(grad_output)
+
+        # Compare gradients (with relaxed tolerances for numerical differences)
+        torch.testing.assert_close(q_triton.grad, q_pytorch.grad, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(k_triton.grad, k_pytorch.grad, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(v_triton.grad, v_pytorch.grad, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(freqs_triton.grad, freqs_pytorch.grad, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(phase_bias_triton.grad, phase_bias_pytorch.grad, rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.skipif(not HAS_TRITON, reason="Triton not available")
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_triton_backward_head_dim_128(self):
+        """Test Triton backward with head_dim=128."""
+        batch, heads, seq, dim = 2, 4, 64, 128
+        device = "cuda"
+
+        q = torch.randn(batch, heads, seq, dim, device=device, requires_grad=True)
+        k = torch.randn(batch, heads, seq, dim, device=device, requires_grad=True)
+        v = torch.randn(batch, heads, seq, dim, device=device, requires_grad=True)
+        freqs = torch.randn(dim, device=device, requires_grad=True)
+        phase_bias = torch.randn(dim, device=device, requires_grad=True)
+
+        out = fpope_attention_forward(q, k, v, freqs, phase_bias, use_triton=True)
+        loss = out.sum()
+        loss.backward()
+
+        # Verify gradients exist and are valid
+        assert q.grad is not None and not torch.isnan(q.grad).any()
+        assert k.grad is not None and not torch.isnan(k.grad).any()
+        assert v.grad is not None and not torch.isnan(v.grad).any()
+        assert freqs.grad is not None and not torch.isnan(freqs.grad).any()
+        assert phase_bias.grad is not None and not torch.isnan(phase_bias.grad).any()
+
 
 class TestFPoPEGroupedQueryAttention:
     """Tests for the FPoPE GQA attention layer."""
