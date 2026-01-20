@@ -1,16 +1,12 @@
-# FoPE+PoPE experiment configuration
-# Inherits most settings from base_config.yaml but uses FPoPE positional encoding
+# NoPE (No Positional Encoding)
+# Baseline: tests if position information is necessary
 #
-# Usage:
-#   python main.py train --config configs/fpope.yaml
-#
-# Evaluation:
-#   python main.py eval --benchmark passkey --context_lengths 512,1024,2048,4096,8192
-#   python main.py eval --benchmark niah --context_lengths 512,1024,2048,4096
-#   python main.py eval --benchmark ruler --context_lengths 512,1024,2048,4096
+# This configuration uses no positional encoding at all.
+# Relies solely on the causal attention mask for order information.
+# Useful as a baseline to measure how much positional encoding helps.
 
 model:
-  # Architecture (same as base)
+  # Architecture
   vocab_size: 50257  # GPT-2 tokenizer
   hidden_dim: 512
   num_layers: 24
@@ -20,18 +16,11 @@ model:
   ffn_dim: null  # Auto-computed with SwiGLU scaling
   ffn_multiple_of: 256
 
-  # Use FoPE+PoPE positional encoding
-  pe_mode: fpope
+  # Positional encoding mode
+  pe_mode: nope
 
-  # Training context length
-  max_seq_len: 512
-
-  # FoPE+PoPE hyperparameters
-  fpope_theta: 10000.0           # Base frequency (same as RoPE default)
-  fpope_num_fourier_terms: 64    # Number of Fourier terms D
-  fpope_sigma: 0.4               # Fourier coefficient initialization variance
-  fpope_training_length: 512     # Floor frequency = 2pi/512 (must match max_seq_len)
-  fpope_delta_init: zero         # Zero init for length generalization
+  # General positional encoding
+  max_seq_len: 512  # Training context length
 
   # Normalization
   norm_eps: 1.0e-6
@@ -68,14 +57,14 @@ training:
   validation_samples: 1000
 
   # Checkpointing
-  checkpoint_dir: checkpoints/fpope
+  checkpoint_dir: checkpoints/nope
   checkpoint_interval: 1000
   keep_last_n: 3
 
   # Logging
   log_interval: 10
   wandb_project: pe-ablations
-  wandb_run_name: fpope-base  # Specific run name for FPoPE experiment
+  wandb_run_name: nope
 
   # Robustness
   loss_spike_threshold: 10.0
@@ -102,11 +91,9 @@ distributed:
   bucket_cap_mb: 50
   find_unused_parameters: false
 
-# Evaluation contexts for length generalization testing
-# Key experiment: trained on 512, evaluated at longer lengths
+# Evaluation contexts for extrapolation testing
 evaluation:
   contexts: [512, 1024, 2048, 4096, 8192, 16384]
   benchmarks:
-    - passkey  # Find hidden passkey in long context
-    - niah     # Needle-in-a-haystack retrieval
-    - ruler    # RULER benchmark for extended context
+    - passkey
+    - niah

@@ -27,6 +27,13 @@ dev = [
 ]
 cuda = []  # CUDA extension built via setup.py
 
+# CUDA Requirements for Blackwell GPUs (RTX 50xx series):
+# - CUDA 12.8+ installed at /usr/local/cuda-12.8
+# - Set environment before building:
+#     export CUDA_HOME=/usr/local/cuda-12.8
+#     export PATH=$CUDA_HOME/bin:$PATH
+# - Use launcher scripts: ./scripts/run_training.sh <config_name>
+
 [project.scripts]
 train = "scripts.train:main"
 evaluate = "scripts.evaluate:main"

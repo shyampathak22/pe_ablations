@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.model.alibi import ALiBiAttention
 from src.model.attention import GroupedQueryAttention
 from src.model.embeddings import TokenEmbedding
 from src.model.ffn import FeedForward
@@ -31,7 +32,7 @@ class TransformerConfig:
     ffn_multiple_of: int = 256
 
     # Positional encoding mode
-    pe_mode: Literal["rope", "fpope"] = "rope"
+    pe_mode: Literal["rope", "fpope", "alibi", "nope"] = "rope"
 
     # General positional encoding
     max_seq_len: int = 512
@@ -120,6 +121,25 @@ class TransformerBlock(nn.Module):
                 head_dim=config.head_dim,
                 use_qk_norm=config.use_qk_norm,
                 fpope=fpope,
+            )
+        elif config.pe_mode == "alibi":
+            # Use ALiBi attention (no learnable position embeddings)
+            self.attention = ALiBiAttention(
+                hidden_dim=config.hidden_dim,
+                num_heads=config.num_heads,
+                num_kv_heads=config.num_kv_heads,
+                head_dim=config.head_dim,
+                use_qk_norm=config.use_qk_norm,
+            )
+        elif config.pe_mode == "nope":
+            # No positional encoding - standard attention without RoPE
+            self.attention = GroupedQueryAttention(
+                hidden_dim=config.hidden_dim,
+                num_heads=config.num_heads,
+                num_kv_heads=config.num_kv_heads,
+                head_dim=config.head_dim,
+                use_qk_norm=config.use_qk_norm,
+                rope=None,  # Explicitly no RoPE
             )
         else:
             # Use standard RoPE attention
@@ -221,6 +241,13 @@ class Transformer(nn.Module):
                 training_length=config.fpope_training_length,
                 delta_init=config.fpope_delta_init,
             )
+        elif config.pe_mode == "alibi":
+            # ALiBi handles position internally via linear biases
+            # No shared positional embedding needed
+            pass
+        elif config.pe_mode == "nope":
+            # No positional encoding at all
+            pass
         else:
             raise ValueError(f"Unknown pe_mode: {config.pe_mode}")
 

@@ -13,7 +13,10 @@ from src.model import Transformer, TransformerConfig
 
 
 def load_model(checkpoint_path: str, device: torch.device) -> tuple[Transformer, TransformerConfig]:
-    """Load a trained model from checkpoint."""
+    """Load a trained model from checkpoint.
+
+    Handles all PE modes: rope, fpope, alibi, nope.
+    """
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     if "config" in checkpoint and "model" in checkpoint["config"]:
@@ -21,7 +24,9 @@ def load_model(checkpoint_path: str, device: torch.device) -> tuple[Transformer,
     else:
         model_cfg = checkpoint.get("model_config", {})
 
+    # Build config with full PE mode awareness
     config = TransformerConfig(
+        # Core architecture
         vocab_size=model_cfg.get("vocab_size", 50257),
         hidden_dim=model_cfg.get("hidden_dim", 512),
         num_layers=model_cfg.get("num_layers", 24),
@@ -29,8 +34,19 @@ def load_model(checkpoint_path: str, device: torch.device) -> tuple[Transformer,
         num_kv_heads=model_cfg.get("num_kv_heads", 4),
         head_dim=model_cfg.get("head_dim", 64),
         max_seq_len=model_cfg.get("max_seq_len", 512),
-        rope_type=model_cfg.get("rope_type", "standard"),
+        # PE mode (supports: rope, fpope, alibi, nope)
+        pe_mode=model_cfg.get("pe_mode", "rope"),
+        # RoPE parameters (used when pe_mode="rope")
         rope_theta=model_cfg.get("rope_theta", 10000.0),
+        rope_type=model_cfg.get("rope_type", "standard"),
+        rope_scale=model_cfg.get("rope_scale", 1.0),
+        # FPoPE parameters (used when pe_mode="fpope")
+        fpope_theta=model_cfg.get("fpope_theta", 10000.0),
+        fpope_num_fourier_terms=model_cfg.get("fpope_num_fourier_terms", 64),
+        fpope_sigma=model_cfg.get("fpope_sigma", 0.4),
+        fpope_training_length=model_cfg.get("fpope_training_length", 512),
+        fpope_delta_init=model_cfg.get("fpope_delta_init", "zero"),
+        # Other parameters
         use_qk_norm=model_cfg.get("use_qk_norm", True),
         tie_embeddings=model_cfg.get("tie_embeddings", True),
     )

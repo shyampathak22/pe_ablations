@@ -1052,15 +1052,28 @@ class FPoPEAttentionFunction(Function):
         """Forward pass."""
         lse = None
         use_cuda = False
+        use_triton_kernel = False
 
-        # Priority 1: Native CUDA kernel
-        if HAS_CUDA_KERNEL and q.is_cuda and q.shape[-1] in (32, 64, 128):
+        # Save original dtypes for backward
+        orig_dtype = q.dtype
+
+        # For float64 inputs (e.g., gradcheck), use PyTorch reference for accuracy
+        # CUDA/Triton kernels only support float32 internally
+        use_pytorch_for_precision = (orig_dtype == torch.float64)
+
+        # Priority 1: Native CUDA kernel (float32 only)
+        if (HAS_CUDA_KERNEL and q.is_cuda and q.shape[-1] in (32, 64, 128)
+                and not use_pytorch_for_precision):
             output, lse = cuda_fpope_attention(
                 q, k, v, freqs, phase_bias, start_pos, scale, return_lse=True
             )
             use_cuda = True
-        # Priority 2: Triton kernel
-        elif use_triton and HAS_TRITON and q.is_cuda:
+            # Preserve original dtype in output
+            if output.dtype != orig_dtype:
+                output = output.to(orig_dtype)
+        # Priority 2: Triton kernel (float32 only)
+        elif (use_triton and HAS_TRITON and q.is_cuda
+              and not use_pytorch_for_precision):
             result = triton_fpope_attention(
                 q, k, v, freqs, phase_bias, start_pos, scale, return_lse=True
             )
@@ -1068,7 +1081,11 @@ class FPoPEAttentionFunction(Function):
                 output, lse = result
             else:
                 output = result
-        # Priority 3: PyTorch reference
+            use_triton_kernel = True
+            # Preserve original dtype in output
+            if output.dtype != orig_dtype:
+                output = output.to(orig_dtype)
+        # Priority 3: PyTorch reference (supports all dtypes)
         else:
             output = pytorch_fpope_attention(
                 q, k, v, freqs, phase_bias, start_pos, scale, causal
@@ -1080,8 +1097,10 @@ class FPoPEAttentionFunction(Function):
         ctx.scale = scale
         ctx.causal = causal
         ctx.use_triton = use_triton
+        ctx.use_triton_kernel = use_triton_kernel
         ctx.use_cuda = use_cuda
         ctx.lse = lse  # Save LSE for backward (may be None)
+        ctx.orig_dtype = orig_dtype  # Save for dtype preservation
 
         return output
 
@@ -1089,8 +1108,9 @@ class FPoPEAttentionFunction(Function):
     def backward(ctx, grad_output: torch.Tensor):
         """Backward pass - uses CUDA > Triton > PyTorch fallback."""
         q, k, v, freqs, phase_bias, output = ctx.saved_tensors
+        orig_dtype = ctx.orig_dtype
 
-        # Priority 1: Native CUDA backward
+        # Priority 1: Native CUDA backward (only for float32 and supported dtypes)
         if ctx.use_cuda and HAS_CUDA_KERNEL and ctx.lse is not None:
             result = cuda_fpope_attention_backward(
                 q, k, v, freqs, phase_bias,
@@ -1099,10 +1119,17 @@ class FPoPEAttentionFunction(Function):
             )
             if result is not None:
                 dq, dk, dv, dfreqs, dphase_bias = result
+                # Convert gradients back to original dtype
+                if dq.dtype != orig_dtype:
+                    dq = dq.to(orig_dtype)
+                    dk = dk.to(orig_dtype)
+                    dv = dv.to(orig_dtype)
+                    dfreqs = dfreqs.to(orig_dtype)
+                    dphase_bias = dphase_bias.to(orig_dtype)
                 return dq, dk, dv, dfreqs, dphase_bias, None, None, None, None
 
         # Priority 2: Triton backward
-        if ctx.use_triton and HAS_TRITON and ctx.lse is not None and q.is_cuda:
+        if ctx.use_triton_kernel and HAS_TRITON and ctx.lse is not None and q.is_cuda:
             result = triton_fpope_attention_backward(
                 q, k, v, freqs, phase_bias,
                 output, grad_output, ctx.lse,
@@ -1110,6 +1137,13 @@ class FPoPEAttentionFunction(Function):
             )
             if result is not None:
                 dq, dk, dv, dfreqs, dphase_bias = result
+                # Convert gradients back to original dtype
+                if dq.dtype != orig_dtype:
+                    dq = dq.to(orig_dtype)
+                    dk = dk.to(orig_dtype)
+                    dv = dv.to(orig_dtype)
+                    dfreqs = dfreqs.to(orig_dtype)
+                    dphase_bias = dphase_bias.to(orig_dtype)
                 return dq, dk, dv, dfreqs, dphase_bias, None, None, None, None
 
         # Priority 3: PyTorch autograd fallback

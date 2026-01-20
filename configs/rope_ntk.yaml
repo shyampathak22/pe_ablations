@@ -36,7 +36,7 @@ training:
   mixed_precision: bf16
   validation_interval: 500
   validation_samples: 1000
-  checkpoint_dir: checkpoints
+  checkpoint_dir: checkpoints/rope_ntk
   checkpoint_interval: 1000
   keep_last_n: 3
   log_interval: 10

@@ -210,6 +210,7 @@ class Trainer:
             "tokens_seen": self.tokens_seen,
             "epoch": self.epoch,
             "config": self.config.__dict__,
+            "model_config": self.model_config.__dict__ if self.model_config else None,
         }
 
         if self.scaler is not None:
@@ -492,6 +493,22 @@ class Trainer:
                         "train/tokens_seen": self.tokens_seen,
                         "train/epoch": self.epoch,
                     }
+
+                    # PE-specific metrics (when model has fpope)
+                    model_unwrapped = self.model.module if hasattr(self.model, "module") else self.model
+                    if hasattr(model_unwrapped, "fpope") and model_unwrapped.fpope is not None:
+                        fpope = model_unwrapped.fpope
+                        with torch.no_grad():
+                            effective_freqs = fpope._compute_effective_freqs()
+                            metrics.update({
+                                "pe/effective_freq_mean": effective_freqs.abs().mean().item(),
+                                "pe/effective_freq_std": effective_freqs.std().item(),
+                                "pe/phase_bias_mean": fpope.phase_bias.mean().item(),
+                                "pe/phase_bias_std": fpope.phase_bias.std().item(),
+                                "pe/fourier_coeff_norm": fpope.fourier_coeffs.norm().item(),
+                                "pe/num_clipped_freqs": (effective_freqs.abs() < fpope.floor_freq).sum().item(),
+                            })
+
                     self._log_metrics(metrics)
 
                     # Format TPS for display (e.g., 125.4K)
