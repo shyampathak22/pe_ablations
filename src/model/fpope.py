@@ -50,6 +50,9 @@ class FoPEPoPEEmbedding(nn.Module):
         fourier_sigma: float = 0.4,
         training_length: int = 512,
         delta_init: Literal["zero", "uniform"] = "zero",
+        freeze_coeffs: bool = False,
+        use_ceiling: bool = False,
+        normalize_coeffs: bool = True,
     ):
         super().__init__()
         self.dim = dim
@@ -64,6 +67,15 @@ class FoPEPoPEEmbedding(nn.Module):
         # Frequencies below 2π/training_length are too slow to learn
         self.floor_freq = 2 * math.pi / training_length
 
+        # Ceiling frequency for clipping over-trained frequencies
+        # One cycle per position max (2π rad/pos)
+        self.use_ceiling = use_ceiling
+        self.ceiling_freq = 2 * math.pi
+
+        # Normalize coefficients as per original FoPE paper
+        # This bounds the frequency contribution and prevents explosion
+        self.normalize_coeffs = normalize_coeffs
+
         # Base frequencies for each dimension (similar to RoPE but full dim)
         # freqs[c] = theta^(-c/dim) for c in [0, dim)
         base_freqs = theta ** (-torch.arange(0, dim, dtype=torch.float32) / dim)
@@ -72,8 +84,9 @@ class FoPEPoPEEmbedding(nn.Module):
         # FoPE: Learnable Fourier coefficients for frequency mixing
         # a_ω ~ N(0, fourier_sigma^2) for each dimension and Fourier term
         # Shape: (dim, num_fourier_terms)
+        # When freeze_coeffs=True, coefficients are fixed (like original FoPE paper)
         fourier_coeffs = torch.randn(dim, num_fourier_terms) * fourier_sigma
-        self.fourier_coeffs = nn.Parameter(fourier_coeffs)
+        self.fourier_coeffs = nn.Parameter(fourier_coeffs, requires_grad=not freeze_coeffs)
 
         # Fourier term indices for frequency computation
         # ω_j = j for j in [1, num_fourier_terms]
@@ -92,16 +105,27 @@ class FoPEPoPEEmbedding(nn.Module):
         self.register_buffer("positions", positions)
 
     def _compute_effective_freqs(self) -> torch.Tensor:
-        """Compute effective frequencies with Fourier mixing and floor clipping.
+        """Compute effective frequencies with Fourier mixing and floor/ceiling clipping.
 
         Returns:
             Tensor of shape (dim,) containing effective frequencies per dimension
         """
+        # Normalize coefficients as per original FoPE paper (page 17)
+        # coeff_normalized = coeff / coeff.sum(dim=-1, keepdim=True)
+        # This bounds the weighted sum and prevents frequency explosion
+        if self.normalize_coeffs:
+            # Normalize along the Fourier term dimension
+            # Add small epsilon to avoid division by zero
+            coeff_sum = self.fourier_coeffs.abs().sum(dim=1, keepdim=True) + 1e-8
+            normalized_coeffs = self.fourier_coeffs / coeff_sum
+        else:
+            normalized_coeffs = self.fourier_coeffs
+
         # Fourier mixing: effective_freq[c] = sum_j(a_{c,j} * base_freq[c] * j)
         # This allows each dimension to have a weighted combination of harmonics
         # Shape: (dim, num_fourier_terms) * (num_fourier_terms,) -> (dim,)
         scaled_indices = self.base_freqs.unsqueeze(1) * self.fourier_indices.unsqueeze(0)
-        effective_freqs = (self.fourier_coeffs * scaled_indices).sum(dim=1)
+        effective_freqs = (normalized_coeffs * scaled_indices).sum(dim=1)
 
         # Add the base frequency as the fundamental
         effective_freqs = effective_freqs + self.base_freqs
@@ -113,6 +137,11 @@ class FoPEPoPEEmbedding(nn.Module):
             torch.zeros_like(effective_freqs),
             effective_freqs,
         )
+
+        # Ceiling frequency clipping: clamp frequencies to max 2π rad/pos
+        # Prevents extrapolation failure from over-trained high frequencies
+        if self.use_ceiling:
+            effective_freqs = effective_freqs.clamp(-self.ceiling_freq, self.ceiling_freq)
 
         return effective_freqs
 

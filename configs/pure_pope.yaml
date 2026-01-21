@@ -1,0 +1,110 @@
+# Pure PoPE (matching Cinnamon reference implementation)
+# Ablation: No Fourier mixing, no floor clipping - exact PoPE paper implementation
+#
+# This is the baseline PoPE implementation from the paper:
+# - Fixed frequencies: θ_i = base^(-i/d)
+# - Learnable delta bias on keys only
+# - Softplus for positive magnitudes
+#
+# Usage:
+#   python scripts/train.py --config configs/pure_pope.yaml
+#
+# Evaluation (PPL degradation):
+#   python scripts/evaluate_ppl_degradation.py --checkpoint-dir checkpoints/pure_pope
+
+model:
+  # Architecture (same as base)
+  vocab_size: 50257  # GPT-2 tokenizer
+  hidden_dim: 512
+  num_layers: 24
+  num_heads: 8
+  num_kv_heads: 4  # GQA-4
+  head_dim: 64
+  ffn_dim: null  # Auto-computed with SwiGLU scaling
+  ffn_multiple_of: 256
+
+  # Use pure PoPE (no floor clipping)
+  pe_mode: pope
+
+  # Training context length
+  max_seq_len: 512
+
+  # PoPE hyperparameters
+  pope_theta: 10000.0           # Base frequency (same as RoPE default)
+  pope_training_length: 512     # Not used for pure_pope (no floor clipping)
+  pope_delta_init: zero         # Zero init for length generalization
+  pope_d_rope: 32               # Position encoding dimension (PoPE doubles to 64)
+
+  # Normalization
+  norm_eps: 1.0e-6
+  use_qk_norm: true
+
+  # Regularization
+  dropout: 0.0  # Modern practice: no dropout
+
+  # Weight tying
+  tie_embeddings: true
+
+  # Training mode
+  gradient_checkpointing: false
+
+training:
+  # Optimization
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  grad_clip: 1.0
+  warmup_steps: 1000
+
+  # Batch configuration
+  total_tokens: 100000000  # 100M tokens
+  batch_size: 8  # Per GPU
+  seq_len: 512
+  gradient_accumulation_steps: 4
+
+  # Mixed precision
+  mixed_precision: bf16
+
+  # Validation
+  validation_interval: 50
+  validation_samples: 100
+
+  # Checkpointing
+  checkpoint_dir: checkpoints/pure_pope
+  checkpoint_interval: 1000
+  keep_last_n: 3
+
+  # Logging
+  log_interval: 10
+  wandb_project: pe-ablations
+  wandb_run_name: pure-pope
+
+  # Robustness
+  loss_spike_threshold: 10.0
+  seed: 42
+
+  # Hardware (for MFU calculation)
+  gpu_peak_tflops: 23.7
+
+data:
+  # Dataset
+  dataset_name: wikitext
+  dataset_config: wikitext-103-raw-v1
+  tokenizer_name: gpt2
+
+  # Pre-tokenized data path
+  data_dir: data/tokenized
+
+  # DataLoader
+  num_workers: 4
+
+# Distributed training
+distributed:
+  backend: nccl
+  bucket_cap_mb: 50
+  find_unused_parameters: false
+
+# Evaluation contexts for length generalization testing (PPL degradation)
+# Key experiment: trained on 512, evaluated at longer lengths
+evaluation:
+  contexts: [512, 1024, 2048, 4096, 8192, 16384]

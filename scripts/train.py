@@ -140,9 +140,16 @@ def main() -> None:
             "fpope_sigma": config["model"].get("fpope_sigma", 0.4),
             "fpope_training_length": config["model"].get("fpope_training_length", 512),
             "fpope_delta_init": config["model"].get("fpope_delta_init", "zero"),
+            "fpope_d_rope": config["model"].get("fpope_d_rope", 32),
+            "fpope_freeze_coeffs": config["model"].get("fpope_freeze_coeffs", False),
+            "fpope_use_ceiling": config["model"].get("fpope_use_ceiling", False),
+            "fpope_normalize_coeffs": config["model"].get("fpope_normalize_coeffs", True),
         })
         print_rank0(f"Using FPoPE positional encoding with theta={model_kwargs['fpope_theta']}, "
-                    f"num_fourier_terms={model_kwargs['fpope_num_fourier_terms']}")
+                    f"num_fourier_terms={model_kwargs['fpope_num_fourier_terms']}, "
+                    f"freeze_coeffs={model_kwargs['fpope_freeze_coeffs']}, "
+                    f"use_ceiling={model_kwargs['fpope_use_ceiling']}, "
+                    f"normalize_coeffs={model_kwargs['fpope_normalize_coeffs']}")
 
     model_config = TransformerConfig(**model_kwargs)
 

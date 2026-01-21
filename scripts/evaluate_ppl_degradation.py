@@ -42,11 +42,21 @@ def load_model(checkpoint_path: str, device: torch.device) -> tuple[Transformer,
         rope_theta=model_cfg.get("rope_theta", 10000.0),
         rope_type=model_cfg.get("rope_type", "standard"),
         rope_scale=model_cfg.get("rope_scale", 1.0),
+        # FPoPE config
         fpope_theta=model_cfg.get("fpope_theta", 10000.0),
         fpope_num_fourier_terms=model_cfg.get("fpope_num_fourier_terms", 64),
         fpope_sigma=model_cfg.get("fpope_sigma", 0.4),
         fpope_training_length=model_cfg.get("fpope_training_length", 512),
         fpope_delta_init=model_cfg.get("fpope_delta_init", "zero"),
+        fpope_d_rope=model_cfg.get("fpope_d_rope", 32),
+        fpope_freeze_coeffs=model_cfg.get("fpope_freeze_coeffs", False),
+        fpope_use_ceiling=model_cfg.get("fpope_use_ceiling", False),
+        fpope_normalize_coeffs=model_cfg.get("fpope_normalize_coeffs", True),
+        # Pure PoPE config
+        pope_theta=model_cfg.get("pope_theta", 10000.0),
+        pope_training_length=model_cfg.get("pope_training_length", 512),
+        pope_delta_init=model_cfg.get("pope_delta_init", "zero"),
+        pope_d_rope=model_cfg.get("pope_d_rope", 32),
     )
 
     model = Transformer(config)
@@ -235,7 +245,8 @@ def main():
     print("-" * (20 + 10 * len(args.context_lengths) + 8))
 
     # Rows sorted by average ratio
-    def avg_ratio(name):
+    def avg_ratio(item):
+        name = item[0] if isinstance(item, tuple) else item
         ratios = [all_results[name]["ratio"].get(c, 999) for c in args.context_lengths[1:]]
         return sum(ratios) / len(ratios) if ratios else 999
 

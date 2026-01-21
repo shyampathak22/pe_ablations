@@ -14,6 +14,7 @@ from src.model.ffn import FeedForward
 from src.model.normalization import RMSNorm
 from src.model.rope import RotaryEmbedding, NTKAwareRotaryEmbedding, YaRNRotaryEmbedding
 from src.model.fpope import FoPEPoPEEmbedding
+from src.model.pope import PoPEEmbedding
 from src.model.fpope_attention import FPoPEGroupedQueryAttention
 
 
@@ -32,7 +33,7 @@ class TransformerConfig:
     ffn_multiple_of: int = 256
 
     # Positional encoding mode
-    pe_mode: Literal["rope", "fpope", "alibi", "nope"] = "rope"
+    pe_mode: Literal["rope", "fpope", "pope", "pope_floor", "alibi", "nope"] = "rope"
 
     # General positional encoding
     max_seq_len: int = 512
@@ -49,6 +50,15 @@ class TransformerConfig:
     fpope_training_length: int = 512  # For floor frequency clipping
     fpope_delta_init: str = "zero"  # "zero" for length gen, "uniform" for in-distribution
     fpope_d_rope: int = 32  # Dimension for position encoding portion (PoPE doubles this)
+    fpope_freeze_coeffs: bool = False  # Freeze Fourier coefficients (like original FoPE paper)
+    fpope_use_ceiling: bool = False  # Apply 2π ceiling clamp to frequencies
+    fpope_normalize_coeffs: bool = True  # Normalize Fourier coefficients (as per FoPE paper)
+
+    # Pure PoPE parameters (used when pe_mode="pope" or "pope_floor")
+    pope_theta: float = 10000.0  # Base frequency (same as RoPE default)
+    pope_training_length: int = 512  # For floor frequency clipping (pope_floor only)
+    pope_delta_init: str = "zero"  # "zero" for length gen, "uniform" for in-distribution
+    pope_d_rope: int = 32  # Dimension for position encoding (PoPE doubles this to 64)
 
     # Normalization
     norm_eps: float = 1e-6
@@ -108,6 +118,7 @@ class TransformerBlock(nn.Module):
         config: TransformerConfig,
         rope: RotaryEmbedding | None = None,
         fpope: FoPEPoPEEmbedding | None = None,
+        pope: PoPEEmbedding | None = None,
     ):
         super().__init__()
 
@@ -123,6 +134,18 @@ class TransformerBlock(nn.Module):
                 d_rope=config.fpope_d_rope,  # Position portion dimension
                 use_qk_norm=config.use_qk_norm,
                 fpope=fpope,
+            )
+        elif config.pe_mode in ("pope", "pope_floor"):
+            # Use pure PoPE attention with content + position split
+            # Reuses FPoPEGroupedQueryAttention since PoPE has same interface
+            self.attention = FPoPEGroupedQueryAttention(
+                hidden_dim=config.hidden_dim,
+                num_heads=config.num_heads,
+                num_kv_heads=config.num_kv_heads,
+                head_dim=config.head_dim,
+                d_rope=config.pope_d_rope,  # Position portion dimension
+                use_qk_norm=config.use_qk_norm,
+                fpope=pope,  # PoPE has same interface as FPoPE (forward_query/forward_key)
             )
         elif config.pe_mode == "alibi":
             # Use ALiBi attention (no learnable position embeddings)
@@ -206,6 +229,7 @@ class Transformer(nn.Module):
         # Initialize positional encoding based on pe_mode
         self.rope = None
         self.fpope = None
+        self.pope = None
 
         if config.pe_mode == "rope":
             # Standard RoPE variants
@@ -242,6 +266,29 @@ class Transformer(nn.Module):
                 fourier_sigma=config.fpope_sigma,
                 training_length=config.fpope_training_length,
                 delta_init=config.fpope_delta_init,
+                freeze_coeffs=config.fpope_freeze_coeffs,
+                use_ceiling=config.fpope_use_ceiling,
+                normalize_coeffs=config.fpope_normalize_coeffs,
+            )
+        elif config.pe_mode == "pope":
+            # Pure PoPE encoding (no Fourier mixing, matching Cinnamon reference)
+            self.pope = PoPEEmbedding(
+                dim=config.pope_d_rope,
+                max_seq_len=config.max_seq_len,
+                theta=config.pope_theta,
+                training_length=config.pope_training_length,
+                use_floor=False,  # Pure PoPE: no floor clipping
+                delta_init=config.pope_delta_init,
+            )
+        elif config.pe_mode == "pope_floor":
+            # PoPE with floor frequency clipping (undertrained freq → zero)
+            self.pope = PoPEEmbedding(
+                dim=config.pope_d_rope,
+                max_seq_len=config.max_seq_len,
+                theta=config.pope_theta,
+                training_length=config.pope_training_length,
+                use_floor=True,  # Floor clipping for undertrained frequencies
+                delta_init=config.pope_delta_init,
             )
         elif config.pe_mode == "alibi":
             # ALiBi handles position internally via linear biases
@@ -254,7 +301,7 @@ class Transformer(nn.Module):
             raise ValueError(f"Unknown pe_mode: {config.pe_mode}")
 
         self.layers = nn.ModuleList([
-            TransformerBlock(config, rope=self.rope, fpope=self.fpope)
+            TransformerBlock(config, rope=self.rope, fpope=self.fpope, pope=self.pope)
             for _ in range(config.num_layers)
         ])
 
@@ -335,6 +382,8 @@ class Transformer(nn.Module):
             self.rope.extend_seq_len(new_max_seq_len)
         if self.fpope is not None:
             self.fpope.extend_seq_len(new_max_seq_len)
+        if self.pope is not None:
+            self.pope.extend_seq_len(new_max_seq_len)
         self.config.max_seq_len = new_max_seq_len
 
     @torch.no_grad()
