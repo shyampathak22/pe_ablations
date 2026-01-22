@@ -166,19 +166,15 @@ class FPoPEGroupedQueryAttention(nn.Module):
         q = torch.cat([q_c, q_r], dim=-1)  # (B, H, S, d_content + d_rope*2)
         k = torch.cat([k_c, k_r], dim=-1)
 
-        # Standard scaled dot-product attention (no custom kernel!)
-        # This can use Flash Attention via PyTorch's SDPA
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-
-        # Causal mask
-        causal_mask = torch.triu(
-            torch.ones(S, S, device=x.device, dtype=torch.bool),
-            diagonal=1
+        # Use PyTorch's scaled_dot_product_attention for Flash Attention
+        # This is O(N) memory instead of O(N²) - critical for long context
+        output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=self.scale,
         )
-        scores = scores.masked_fill(causal_mask, float('-inf'))
-
-        attn_probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(v.dtype)
-        output = torch.matmul(attn_probs, v)
 
         # Reshape and project output
         output = output.transpose(1, 2).contiguous().view(B, S, -1)
@@ -311,19 +307,21 @@ class FPoPEGroupedQueryAttentionWithCache(FPoPEGroupedQueryAttention):
         # Concatenate query content + position
         q = torch.cat([q_c, q_r], dim=-1)
 
-        # Attention
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-
-        # Causal mask for cached attention
+        # Use SDPA with Flash Attention for memory efficiency
+        # For cached attention, we can't use is_causal=True directly
+        # because the sequence lengths differ, so we use a custom mask
         total_len = k.shape[2]
         causal_mask = torch.triu(
             torch.ones(S, total_len, device=x.device, dtype=torch.bool),
             diagonal=total_len - S + 1
         )
-        scores = scores.masked_fill(causal_mask, float('-inf'))
-
-        attn_probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(v.dtype)
-        output = torch.matmul(attn_probs, v)
+        output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=~causal_mask,  # SDPA uses True=attend, opposite of masked_fill
+            dropout_p=0.0,
+            is_causal=False,
+            scale=self.scale,
+        )
 
         output = output.transpose(1, 2).contiguous().view(B, S, -1)
         return self.wo(output)

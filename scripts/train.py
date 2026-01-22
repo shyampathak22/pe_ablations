@@ -91,6 +91,7 @@ def main() -> None:
                 dataset_name=config["data"]["dataset_name"],
                 dataset_config=config["data"]["dataset_config"],
                 tokenizer_name=config["data"]["tokenizer_name"],
+                max_tokens=config["training"].get("total_tokens"),
             )
             print_rank0(f"Token counts: {token_counts}")
 
@@ -183,16 +184,20 @@ def main() -> None:
         rank=rank,
     )
 
-    val_loader = create_dataloader(
-        data_path=data_dir,
-        seq_len=config["training"]["seq_len"],
-        batch_size=config["training"]["batch_size"],
-        split="validation",
-        num_workers=config["data"]["num_workers"],
-        distributed=(world_size > 1),
-        world_size=world_size,
-        rank=rank,
-    )
+    val_loader = None
+    if (data_dir / "validation.bin").exists():
+        val_loader = create_dataloader(
+            data_path=data_dir,
+            seq_len=config["training"]["seq_len"],
+            batch_size=config["training"]["batch_size"],
+            split="validation",
+            num_workers=config["data"]["num_workers"],
+            distributed=(world_size > 1),
+            world_size=world_size,
+            rank=rank,
+        )
+    else:
+        print_rank0("No validation split found, skipping validation")
 
     checkpoint_dir = args.checkpoint_dir or config["training"]["checkpoint_dir"]
     wandb_run_name = args.wandb_run_name or config["training"]["wandb_run_name"]

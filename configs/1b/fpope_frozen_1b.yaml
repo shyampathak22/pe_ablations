@@ -51,10 +51,10 @@ training:
   gpu_peak_tflops: 23.7
 
 data:
-  dataset_name: wikitext
-  dataset_config: wikitext-103-raw-v1
+  dataset_name: openwebtext
+  dataset_config: plain_text
   tokenizer_name: gpt2
-  data_dir: data/tokenized
+  data_dir: data/openwebtext_tokenized
   num_workers: 4
 
 distributed:

@@ -75,8 +75,11 @@ def pretokenize_dataset(
     dataset_config: str = "wikitext-103-raw-v1",
     tokenizer_name: str = "gpt2",
     num_proc: int = 4,
+    max_tokens: int | None = None,
 ) -> dict[str, int]:
     """Pre-tokenize a dataset and save as memory-mapped numpy arrays.
+
+    Streams tokens directly to disk to handle large datasets without OOM.
 
     Args:
         output_dir: Directory to save tokenized data
@@ -84,6 +87,7 @@ def pretokenize_dataset(
         dataset_config: Dataset configuration name
         tokenizer_name: Tokenizer to use
         num_proc: Number of processes for tokenization
+        max_tokens: Maximum tokens to collect (None for all)
 
     Returns:
         Dictionary with token counts for each split
@@ -115,19 +119,52 @@ def pretokenize_dataset(
             desc=f"Tokenizing {split}",
         )
 
-        all_tokens = []
-        for example in tqdm(tokenized, desc=f"Collecting {split} tokens"):
-            all_tokens.extend(example["tokens"])
-
-        all_tokens = np.array(all_tokens, dtype=np.uint16)
-        token_counts[split] = len(all_tokens)
-
+        # Stream tokens to disk in chunks to avoid OOM
         bin_file = output_dir / f"{split}.bin"
-        memmap = np.memmap(bin_file, dtype=np.uint16, mode="w+", shape=all_tokens.shape)
-        memmap[:] = all_tokens
-        memmap.flush()
+        chunk_size = 10_000_000  # 10M tokens per chunk
 
-        print(f"{split}: {len(all_tokens):,} tokens saved to {bin_file}")
+        # First pass: count total tokens (or use max_tokens limit)
+        if max_tokens and split == "train":
+            target_tokens = max_tokens
+            print(f"Target: {target_tokens:,} tokens")
+        else:
+            # For validation or no limit, estimate from dataset size
+            target_tokens = max_tokens if max_tokens else len(tokenized) * 500  # rough estimate
+
+        # Pre-allocate memmap file
+        memmap = np.memmap(bin_file, dtype=np.uint16, mode="w+", shape=(target_tokens,))
+
+        offset = 0
+        for example in tqdm(tokenized, desc=f"Writing {split} tokens"):
+            tokens = example["tokens"]
+            n = len(tokens)
+
+            if offset + n > target_tokens:
+                # Truncate to fit
+                n = target_tokens - offset
+                tokens = tokens[:n]
+
+            if n > 0:
+                memmap[offset:offset + n] = np.array(tokens, dtype=np.uint16)
+                offset += n
+
+            if offset >= target_tokens:
+                break
+
+        # Truncate file to actual size
+        memmap.flush()
+        del memmap
+
+        # Reopen with correct size
+        if offset < target_tokens:
+            final_memmap = np.memmap(bin_file, dtype=np.uint16, mode="r+", shape=(offset,))
+            final_memmap.flush()
+            # Truncate the file
+            with open(bin_file, "r+b") as f:
+                f.truncate(offset * 2)  # uint16 = 2 bytes
+
+        token_counts[split] = offset
+        print(f"{split}: {offset:,} tokens saved to {bin_file}")
 
     return token_counts
 
